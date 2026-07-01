@@ -1,0 +1,503 @@
+/* Jardio OS v5.6.7.7 - Calendar Scheduler */
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+#include <FS.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <ArduinoJson.h>
+#include <Audio.h>
+#include "time.h"
+
+#define SD_CS 4 
+#define SD_MOSI 5 
+#define SD_SCK 6 
+#define SD_MISO 7
+#define I2S_BCLK 17
+#define I2S_LRC 16
+#define I2S_DOUT 15
+
+String getDashboard();
+String getMediaUI();
+String getPlaylistUI();
+String getSchedulerUI();
+String getSystemUI();
+String getSetupUI();
+void audioTask(void *pvParameters);
+void indexTracks();
+String shortenName(String name);
+String urlEncode(String str);
+String urlDecode(String str);
+void initPlaylists();
+bool isInPlaylist(const String& filename, int playlistNum);
+
+Audio audio;
+WebServer server(80);
+WiFiServer apiServer(11000);
+File uploadFile;
+SPIClass sdSPI(HSPI);
+
+String musicListCache = "";
+String spotListCache = "";
+String spotTriggersCache = "";
+String eventsCache = "";
+
+int musicVolume = 15;
+int spotVolume = 20;
+bool isSpotPlaying = false;
+
+String nowPlayingTrack = "";
+String lastPlayedFile = "";
+
+struct Config {
+  String ssid = ""; String pass = "";
+  bool dhcp = true;
+  String ip = "192.168.1.100"; String gw = "192.168.1.1";
+  String mask = "255.255.255.0"; String dns = "8.8.8.8";
+  String mdns = "jardio";
+  int musicVol = 15;
+  int spotVol = 20;
+  String ntpServer = "pool.ntp.org";
+  String tz = "CET-1CEST,M3.5.0,M10.5.0/3"; 
+} cfg;
+
+bool apMode = false;
+
+String shortenName(String name) {
+  int dot = name.lastIndexOf('.');
+  if (dot > 0) name = name.substring(0, dot);
+  if (name.length() > 20) name = name.substring(0,20) + "...";
+  return name;
+}
+
+String urlEncode(String str) {
+  String encoded = "";
+  for (unsigned int i = 0; i < str.length(); i++) {
+    char c = str.charAt(i);
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') encoded += c;
+    else { encoded += '%'; encoded += String(c, HEX); }
+  }
+  return encoded;
+}
+
+String urlDecode(String str) {
+  String decoded = "";
+  for (unsigned int i = 0; i < str.length(); i++) {
+    if (str.charAt(i) == '%') {
+      if (i + 2 < str.length()) {
+        char c = strtol(str.substring(i+1, i+3).c_str(), NULL, 16);
+        decoded += c;
+        i += 2;
+      }
+    } else if (str.charAt(i) == '+') decoded += ' ';
+    else decoded += str.charAt(i);
+  }
+  return decoded;
+}
+
+void initPlaylists() {
+  if (!SD.exists("/playlist")) SD.mkdir("/playlist");
+  for(int i = 1; i <= 10; i++) {
+    String path = "/playlist/pl" + String(i) + ".csv";
+    if (!SD.exists(path)) {
+      File f = SD.open(path, FILE_WRITE);
+      if (f) f.close();
+    }
+  }
+}
+
+bool isInPlaylist(const String& filename, int playlistNum) {
+  String path = "/playlist/pl" + String(playlistNum) + ".csv";
+  File f = SD.open(path);
+  if (!f) return false;
+  while(f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line == filename) {
+      f.close();
+      return true;
+    }
+  }
+  f.close();
+  return false;
+}
+
+void indexTracks() {
+  musicListCache = ""; spotListCache = ""; spotTriggersCache = "";
+  File rootMusic = SD.open("/music");
+  if (rootMusic) {
+    File f = rootMusic.openNextFile();
+    while(f) {
+      if(!f.isDirectory()) {
+        String n = f.name();
+        String shortN = shortenName(n);
+        String enc = urlEncode(n);
+        musicListCache += "<div class='media-item'><span>" + shortN + "</span><div><button class='btn-s' onclick=\"cmd('/api/play?f=" + enc + "')\">PLAY</button><button class='btn-s del' onclick=\"if(confirm('Smazat?')) del('/music/" + enc + "')\">DEL</button></div></div>";
+      }
+      f = rootMusic.openNextFile();
+    }
+    rootMusic.close();
+  }
+  File rootSpot = SD.open("/spot");
+  if (rootSpot) {
+    File f = rootSpot.openNextFile();
+    while(f) {
+      if(!f.isDirectory()) {
+        String n = f.name();
+        String shortN = shortenName(n);
+        String enc = urlEncode(n);
+        spotListCache += "<div class='media-item'><span>" + shortN + "</span><div><button class='btn-s' onclick=\"cmd('/api/play-spot?f=" + enc + "')\">PLAY</button><button class='btn-s del' onclick=\"if(confirm('Smazat?')) del('/spot/" + enc + "')\">DEL</button></div></div>";
+        if (n.length() >= 3 && isdigit(n[0]) && n[1] == '_') {
+          int num = n.substring(0,2).toInt();
+          if (num >= 1 && num <= 10) spotTriggersCache += "<button class='spot-trigger' onclick=\"cmd('/api/play-spot?f=" + enc + "')\">" + shortN + "</button>";
+        }
+      }
+      f = rootSpot.openNextFile();
+    }
+    rootSpot.close();
+  }
+}
+
+bool loadConfig() {
+  File f = SD.open("/config/system.json");
+  if (!f) return false;
+  StaticJsonDocument<2048> doc;
+  if (deserializeJson(doc, f)) { f.close(); return false; }
+  cfg.ssid = doc["wifi"]["ssid"] | ""; cfg.pass = doc["wifi"]["pass"] | "";
+  cfg.dhcp = doc["net"]["dhcp"] | true;
+  cfg.ip = doc["net"]["ip"] | "192.168.1.100";
+  cfg.gw = doc["net"]["gw"] | "192.168.1.1";
+  cfg.mask = doc["net"]["mask"] | "255.255.255.0";
+  cfg.dns = doc["net"]["dns"] | "8.8.8.8";
+  cfg.mdns = doc["mdns"] | "jardio";
+  cfg.musicVol = doc["volume"]["music"] | 15;
+  cfg.spotVol = doc["volume"]["spot"] | 20;
+  cfg.ntpServer = doc["time"]["ntp"] | "pool.ntp.org";
+  cfg.tz = doc["time"]["tz"] | "CET-1CEST,M3.5.0,M10.5.0/3";
+  musicVolume = cfg.musicVol;
+  spotVolume = cfg.spotVol;
+  f.close(); return true;
+}
+
+void saveConfig() {
+  File f = SD.open("/config/system.json", FILE_WRITE);
+  StaticJsonDocument<2048> doc;
+  doc["wifi"]["ssid"] = cfg.ssid; doc["wifi"]["pass"] = cfg.pass;
+  doc["net"]["dhcp"] = cfg.dhcp; doc["net"]["ip"] = cfg.ip;
+  doc["net"]["gw"] = cfg.gw; doc["net"]["mask"] = cfg.mask; doc["net"]["dns"] = cfg.dns;
+  doc["mdns"] = cfg.mdns;
+  doc["volume"]["music"] = cfg.musicVol;
+  doc["volume"]["spot"] = cfg.spotVol;
+  doc["time"]["ntp"] = cfg.ntpServer;
+  doc["time"]["tz"] = cfg.tz;
+  serializeJson(doc, f); f.close();
+}
+
+void audioTask(void *pvParameters) {
+  for(;;) {
+    audio.loop();
+    if (isSpotPlaying && !audio.isRunning()) {
+      isSpotPlaying = false;
+      audio.setVolume(musicVolume);
+      if (lastPlayedFile != "") audio.connecttoFS(SD, lastPlayedFile.c_str());
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+String getHeader() {
+  String h = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  h += "<style>body{font-family:sans-serif;background:#0b0e14;color:#cfd3d7;margin:0;display:flex;height:100vh;}"
+       ".sidebar{width:100px;background:#161a23;display:flex;flex-direction:column;align-items:center;padding-top:20px;border-right:1px solid #282c34;}"
+       ".sidebar a{color:#8b949e;text-decoration:none;font-size:11px;margin-bottom:25px;text-align:center;cursor:pointer;}"
+       ".main{flex:1;padding:25px;overflow-y:auto;} .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:20px;}"
+       ".tile{background:#1c212c;border-radius:12px;padding:20px;} .clock{font-size:32px;font-weight:bold;color:#fff;}"
+       "input, select, button{width:100%;padding:10px;border-radius:6px;margin:5px 0;border:none;box-sizing:border-box;background:#282c34;color:#fff;}"
+       "button{background:#007bff;cursor:pointer;font-weight:bold;} .btn-s{width:auto;padding:5px 10px;font-size:11px;margin-left:5px;} .del{background:#d73a49;}"
+       ".media-item{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #2d333b;align-items:center;}"
+       ".spot-trigger{background:#f39c12;margin:4px;width:calc(50% - 8px);display:inline-block;font-size:11px;}</style>";
+  h += "<script>"
+       "function cmd(u){fetch(u).then(()=>{location.reload();});}"
+       "function del(p){fetch('/api/delete?p='+p).then(()=>location.reload());}"
+       "function toggleAll(cb, col) {let boxes = document.querySelectorAll('input[name=pl' + col + ']');boxes.forEach(box => box.checked = cb.checked);}"
+       "</script></head><body>";
+  h += "<div class='sidebar'><div style='color:#007bff;font-size:24px;font-weight:bold;margin-bottom:30px;'>J</div>";
+  h += "<a href='/'>DASHBOARD</a><a href='/media'>MEDIA</a><a href='/playlists'>PLAYLISTS</a><a href='/scheduler'>SCHEDULER</a><a href='/system'>SYSTEM</a></div>";
+  return h;
+}
+
+String getDashboard() {
+  time_t now; struct tm ti; time(&now); localtime_r(&now, &ti);
+  char tS[9] = {0}; char dS[11] = {0}; 
+  strftime(tS, sizeof(tS), "%H:%M:%S", &ti);
+  strftime(dS, sizeof(dS), "%d.%m.%Y", &ti);
+  String h = getHeader();
+  h += "<div class='main'><h1>Jardio SP1</h1><div class='grid'>";
+  h += "<div class='tile'><h2>Čas a Stav</h2><div class='clock'>" + String(tS) + "</div><div style='color:#8b949e;'>" + String(dS) + "<br>IP: " + WiFi.localIP().toString() + "</div></div>";
+  h += "<div class='tile'><h2>Právě hraje</h2><div style='background:#282c34;padding:15px;border-radius:8px;'>" + (nowPlayingTrack.length() ? shortenName(nowPlayingTrack) : "Neaktivní") + "</div>";
+  h += "<div style='display:flex;gap:10px;margin-top:15px;'><button onclick=\"cmd('/api/resume')\">PAUSE / RESUME</button><button onclick=\"cmd('/api/stop')\" style='background:#d73a49;'>STOP</button></div></div>";
+  h += "<div class='tile'><h2>Rychlá hlášení (SPOTy 1-10)</h2>" + spotTriggersCache + "</div>";
+  h += "</div></div></body></html>";
+  return h;
+}
+
+String getMediaUI() {
+  String h = getHeader();
+  h += "<div class='main'><h1>Správa Media</h1><div class='grid'>";
+  h += "<div class='tile'><h2>Import Music</h2><form method='POST' action='/api/upload/music' enctype='multipart/form-data'><input type='file' name='u' multiple><button type='submit'>NAHRÁT DO /music</button></form></div>";
+  h += "<div class='tile'><h2>Import Spoty</h2><form method='POST' action='/api/upload/spot' enctype='multipart/form-data'><input type='file' name='u' multiple><button type='submit'>NAHRÁT DO /spot</button></form></div>";
+  h += "<div class='tile'><h2>Hudba (/music)</h2>" + musicListCache + "</div>";
+  h += "<div class='tile'><h2>Spoty (/spot)</h2>" + spotListCache + "</div>";
+  h += "</div></div></body></html>";
+  return h;
+}
+
+String getPlaylistUI() {
+  String h = getHeader();
+  h += "<div class='main'><h1>Playlisty - Multiselect</h1><div class='tile'>";
+  h += "<p><strong>Vyberte skladby a zaškrtněte playlisty.</strong></p>";
+  h += "<form action='/api/saveplaylists' method='POST'>";
+  h += "<div class='media-item' style='background:#282c34;padding:10px;font-weight:bold;'><span><strong>Označit vše</strong></span>";
+  h += "<div style='display:flex;gap:12px;flex-wrap:wrap;'>";
+  for(int i=1; i<=10; i++) {
+    h += "<label><input type='checkbox' onclick=\"toggleAll(this, " + String(i) + ")\" id='all" + String(i) + "'> " + String(i) + "</label>";
+  }
+  h += "</div></div>";
+  File root = SD.open("/music");
+  if (root) {
+    File f = root.openNextFile();
+    while(f) {
+      if(!f.isDirectory()) {
+        String n = f.name();
+        String shortN = shortenName(n);
+        String enc = urlEncode(n);
+        h += "<div class='media-item'><span>" + shortN + "</span>";
+        h += "<div style='display:flex;gap:8px;flex-wrap:wrap;'>";
+        for(int i=1; i<=10; i++) {
+          bool checked = isInPlaylist(n, i);
+          h += "<label style='margin:2px 6px; white-space:nowrap;'><input type='checkbox' name='pl" + String(i) + "' value='" + enc + "' " + (checked ? "checked" : "") + "> " + String(i) + "</label>";
+        }
+        h += "</div></div>";
+      }
+      f = root.openNextFile();
+    }
+    root.close();
+  }
+  h += "<br><button type='submit' style='background:#28a745;padding:12px;'>ULOŽIT VŠECHNY PLAYLISTY</button>";
+  h += "</form></div></div></body></html>";
+  return h;
+}
+
+String getSchedulerUI() {
+  String h = getHeader();
+  h += "<div class='main'><h1>Týdenní Kalendář (00:00 - 23:00)</h1>";
+  h += "<div style='overflow-x:auto;'><table style='width:100%;border-collapse:collapse;table-layout:fixed;background:#1c212c;'>";
+  h += "<tr><th style='width:70px;background:#161a23;'>Hodina</th><th>Po</th><th>Út</th><th>St</th><th>Čt</th><th>Pá</th><th>So</th><th>Ne</th></tr>";
+  for(int hour = 0; hour <= 23; hour++) {
+    h += "<tr style='height:48px;border-bottom:1px solid #333;'>";
+    h += "<td style='text-align:right;padding-right:10px;font-weight:bold;background:#161a23;'>" + String(hour) + ":00</td>";
+    for(int day = 0; day < 7; day++) {
+      h += "<td style='border:1px solid #333;position:relative;vertical-align:top;'></td>";
+    }
+    h += "</tr>";
+  }
+  h += "</table></div>";
+  if (eventsCache.length() > 0) h += "<div style='margin-top:15px;background:#282c34;padding:10px;'>" + eventsCache + "</div>";
+
+  h += "<div class='tile' style='margin-top:20px;'><h2>Přidat událost</h2>";
+  h += "<form action='/api/addschedule' method='POST'>";
+  h += "Den: <select name='day'><option value='0'>Pondělí</option><option value='1'>Úterý</option><option value='2'>Středa</option><option value='3'>Čtvrtek</option><option value='4'>Pátek</option><option value='5'>Sobota</option><option value='6'>Neděle</option></select><br><br>";
+  h += "Od: <input type='time' name='start' value='08:00'> Do: <input type='time' name='end' value='22:00'><br><br>";
+  h += "Typ: <select name='type'><option value='playlist'>Playlist</option><option value='spot'>Spot</option><option value='volume'>Hlasitost</option></select><br><br>";
+  h += "Cíl: <select name='target'>";
+  for(int i=1; i<=10; i++) h += "<option value='" + String(i) + "'>PL/Spot " + String(i) + "</option>";
+  h += "</select><br><br>";
+  h += "Opakování: <select name='repeat'><option value='1'>1x</option><option value='2'>2x</option><option value='3'>3x</option><option value='4'>4x</option><option value='5'>5x</option></select><br><br>";
+  h += "Hlasitost: <input type='number' name='vol' value='15' min='0' max='21'><br><br>";
+  h += "<button type='submit' style='background:#28a745;padding:12px;'>PŘIDAT UDÁLOST</button>";
+  h += "</form></div></div></body></html>";
+  return h;
+}
+
+String getSystemUI() {
+  String h = getHeader();
+  h += "<div class='main'><h1>Nastavení systému</h1><div class='grid'>";
+  h += "<div class='tile'><h2>Síťové nastavení</h2><form action='/api/net'>";
+  h += "Režim <select name='dhcp'><option value='1' "+String(cfg.dhcp?"selected":"")+">DHCP</option><option value='0' "+String(!cfg.dhcp?"selected":"")+">Statika</option></select>";
+  h += "IP <input name='ip' value='"+cfg.ip+"'> GW <input name='gw' value='"+cfg.gw+"'> Mask <input name='mask' value='"+cfg.mask+"'> DNS <input name='dns' value='"+cfg.dns+"'>";
+  h += "<button type='submit'>ULOŽIT SÍŤ</button></form></div>";
+  h += "<div class='tile'><h2>Hlasitost</h2><form action='/api/vol'>";
+  h += "Hudba: <select name='musicvol'>";
+  for(int i=0; i<=21; i++) h += "<option value='"+String(i)+"' "+String(musicVolume==i?"selected":"")+">"+String(i)+"</option>";
+  h += "</select><br>Spoty: <select name='spotvol'>";
+  for(int i=0; i<=21; i++) h += "<option value='"+String(i)+"' "+String(spotVolume==i?"selected":"")+">"+String(i)+"</option>";
+  h += "</select><button type='submit'>ULOŽIT HLASITOST</button></form></div>";
+  h += "<div class='tile'><h2>Časová synchronizace</h2><form action='/api/time'>";
+  h += "NTP: <input name='ntp' value='"+cfg.ntpServer+"'><br>Timezone: <input name='tz' value='"+cfg.tz+"'>";
+  h += "<button type='submit'>ULOŽIT ČAS</button></form></div>";
+  h += "<div class='tile'><button onclick=\"if(confirm('Restartovat?')) fetch('/api/restart').then(()=>location.reload());\" style='background:#d73a49;padding:15px;'>RESTART ESP32</button></div>";
+  h += "</div></div></body></html>";
+  return h;
+}
+
+String getSetupUI() { return "<h1>Setup Mode</h1>"; }
+
+void handleSavePlaylists() {
+  for(int i = 1; i <= 10; i++) {
+    String filename = "/playlist/pl" + String(i) + ".csv";
+    SD.remove(filename);
+    File f = SD.open(filename, FILE_WRITE);
+    if (f) {
+      for(int j = 0; j < server.args(); j++) {
+        if (server.argName(j) == "pl" + String(i)) {
+          String val = server.arg(j);
+          val = urlDecode(val);
+          f.println(val);
+        }
+      }
+      f.close();
+    }
+  }
+  server.sendHeader("Location", "/playlists");
+  server.send(303);
+}
+
+void handleAddSchedule() {
+  if (server.hasArg("day") && server.hasArg("start") && server.hasArg("type")) {
+    String entry = "<div style='background:#3498db;color:white;padding:8px;margin:5px 0;border-radius:4px;'>";
+    entry += "Den " + server.arg("day") + " | " + server.arg("start") + "-" + server.arg("end") + " | " + server.arg("type") + " " + server.arg("target");
+    entry += "</div>";
+    eventsCache += entry;
+  }
+  server.sendHeader("Location", "/scheduler");
+  server.send(303);
+}
+
+void handleFileUpload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    String folder = server.uri().indexOf("/music") != -1 ? "/music/" : "/spot/";
+    uploadFile = SD.open(folder + upload.filename, FILE_WRITE);
+  } else if (upload.status == UPLOAD_FILE_WRITE && uploadFile) {
+    uploadFile.write(upload.buf, upload.currentSize);
+  } else if (upload.status == UPLOAD_FILE_END && uploadFile) {
+    uploadFile.close();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, sdSPI, 20000000)) { Serial.println("SD FAIL"); while(1) delay(1000); }
+
+  initPlaylists();
+  const char* dirs[] = {"/config", "/music", "/playlist", "/scheduler", "/spot"};
+  for(const char* d : dirs) if(!SD.exists(d)) SD.mkdir(d);
+
+  indexTracks();
+  loadConfig();
+
+  if (loadConfig()) {
+    WiFi.mode(WIFI_STA);
+    if (!cfg.dhcp) {
+      IPAddress ip, gw, nm, d1; ip.fromString(cfg.ip); gw.fromString(cfg.gw); nm.fromString(cfg.mask); d1.fromString(cfg.dns);
+      WiFi.config(ip, gw, nm, d1);
+    }
+    WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
+    unsigned long st = millis(); while (WiFi.status() != WL_CONNECTED && millis()-st < 8000) delay(500);
+  }
+
+  if (WiFi.status() != WL_CONNECTED) { 
+    apMode = true; 
+    WiFi.mode(WIFI_AP); 
+    WiFi.softAP("Jardio-SP1", "admin123"); 
+  } else { 
+    MDNS.begin(cfg.mdns.c_str()); 
+    configTime(0, 0, cfg.ntpServer.c_str()); 
+    setenv("TZ", cfg.tz.c_str(), 1); 
+    tzset(); 
+  }
+
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  audio.setVolume(musicVolume);
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 20000, NULL, 6, NULL, 1);
+
+  server.on("/", []() { server.send(200, "text/html", apMode ? getSetupUI() : getDashboard()); });
+  server.on("/media", []() { server.send(200, "text/html", getMediaUI()); });
+  server.on("/playlists", []() { server.send(200, "text/html", getPlaylistUI()); });
+  server.on("/scheduler", []() { server.send(200, "text/html", getSchedulerUI()); });
+  server.on("/system", []() { server.send(200, "text/html", getSystemUI()); });
+
+  server.on("/api/saveplaylists", HTTP_POST, handleSavePlaylists);
+  server.on("/api/addschedule", HTTP_POST, handleAddSchedule);
+
+  server.on("/api/play", []() { 
+    if (server.hasArg("f")) { 
+      String fName = urlDecode(server.arg("f"));
+      nowPlayingTrack = fName;
+      lastPlayedFile = "/music/" + fName;
+      audio.connecttoFS(SD, lastPlayedFile.c_str());
+      audio.setVolume(musicVolume);
+      isSpotPlaying = false;
+    } 
+    server.send(200); 
+  });
+  
+  server.on("/api/play-spot", []() { 
+    if (server.hasArg("f")) { 
+      String fName = urlDecode(server.arg("f"));
+      audio.pauseResume();
+      audio.setVolume(spotVolume);
+      audio.connecttoFS(SD, ("/spot/" + fName).c_str());
+      isSpotPlaying = true;
+    } 
+    server.send(200); 
+  });
+
+  server.on("/api/stop", []() { audio.stopSong(); isSpotPlaying = false; server.send(200); });
+  server.on("/api/resume", []() { audio.pauseResume(); server.send(200); });
+  
+  server.on("/api/vol", []() {
+    if(server.hasArg("musicvol")) { musicVolume = server.arg("musicvol").toInt(); cfg.musicVol = musicVolume; }
+    if(server.hasArg("spotvol")) { spotVolume = server.arg("spotvol").toInt(); cfg.spotVol = spotVolume; }
+    saveConfig();
+    audio.setVolume(isSpotPlaying ? spotVolume : musicVolume);
+    server.sendHeader("Location", "/system"); server.send(303);
+  });
+  
+  server.on("/api/time", []() {
+    if(server.hasArg("ntp")) cfg.ntpServer = server.arg("ntp");
+    if(server.hasArg("tz")) cfg.tz = server.arg("tz");
+    saveConfig();
+    configTime(0, 0, cfg.ntpServer.c_str());
+    setenv("TZ", cfg.tz.c_str(), 1); tzset();
+    server.sendHeader("Location", "/system"); server.send(303);
+  });
+  
+  server.on("/api/net", []() {
+    cfg.dhcp = (server.arg("dhcp") == "1"); cfg.ip = server.arg("ip"); cfg.gw = server.arg("gw");
+    cfg.mask = server.arg("mask"); cfg.dns = server.arg("dns");
+    saveConfig(); server.sendHeader("Location", "/system"); server.send(303);
+  });
+  
+  server.on("/api/restart", []() { server.send(200); delay(500); ESP.restart(); });
+  
+  server.on("/api/upload/music", HTTP_POST, [](){ indexTracks(); server.sendHeader("Location", "/media"); server.send(303); }, handleFileUpload);
+  server.on("/api/upload/spot", HTTP_POST, [](){ indexTracks(); server.sendHeader("Location", "/media"); server.send(303); }, handleFileUpload);
+  
+  server.on("/api/delete", []() { 
+    if (server.hasArg("p")) { 
+      SD.remove(server.arg("p")); 
+      indexTracks(); 
+    } 
+    server.send(200); 
+  });
+
+  server.begin(); 
+  apiServer.begin(11000);
+}
+
+void loop() {
+  server.handleClient();
+}
