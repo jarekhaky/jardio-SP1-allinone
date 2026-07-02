@@ -40,6 +40,7 @@ String getPlaylistUI();
 String getSchedulerUI();
 String getSystemUI();
 String getSetupUI();
+String getHeader();
 void audioTask(void *pvParameters);
 void schedulerTask(void *pvParameters);
 void indexTracks();
@@ -53,10 +54,13 @@ void loadScheduleEvents();
 void saveScheduleEvents();
 void processScheduleEvents();
 void playPlaylist(int playlistNum);
+void playTrackByName(String filename);
 void playSpot(String filename, int volume);
 void resumeMusic();
 int getSpotPrefix(String filename);
 String findSpotFile(int spotNum);
+String jsQuote(const String& s);
+String htmlEscape(const String& s);
 
 // ========== GLOBAL VARIABLES ==========
 Audio audio;
@@ -110,10 +114,16 @@ String shortenName(String name) {
 
 String urlEncode(String str) {
   String encoded = "";
+  const char* hex = "0123456789ABCDEF";
   for (unsigned int i = 0; i < str.length(); i++) {
-    char c = str.charAt(i);
-    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') encoded += c;
-    else { encoded += '%'; encoded += String(c, HEX); }
+    unsigned char c = (unsigned char)str.charAt(i);
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += (char)c;
+    } else {
+      encoded += '%';
+      encoded += hex[(c >> 4) & 0x0F];
+      encoded += hex[c & 0x0F];
+    }
   }
   return encoded;
 }
@@ -133,6 +143,34 @@ String urlDecode(String str) {
   return decoded;
 }
 
+String jsQuote(const String& s) {
+  String out = "";
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if (c == '\\') out += "\\\\";
+    else if (c == '\"') out += "\\\"";
+    else if (c == '\'') out += "\\'";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else out += c;
+  }
+  return out;
+}
+
+String htmlEscape(const String& s) {
+  String out = "";
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if (c == '&') out += "&amp;";
+    else if (c == '<') out += "&lt;";
+    else if (c == '>') out += "&gt;";
+    else if (c == '\"') out += "&quot;";
+    else if (c == '\'') out += "&#39;";
+    else out += c;
+  }
+  return out;
+}
+
 int getSpotPrefix(String filename) {
   int underscorePos = filename.indexOf('_');
   if (underscorePos <= 0) return -1;
@@ -149,6 +187,9 @@ String findSpotFile(int spotNum) {
   while(f) {
     if (!f.isDirectory()) {
       String n = f.name();
+      if (n.startsWith("/")) n = n.substring(1);
+      int slash = n.lastIndexOf('/');
+      if (slash >= 0) n = n.substring(slash + 1);
       if (getSpotPrefix(n) == spotNum) {
         String result = n;
         f.close();
@@ -231,6 +272,7 @@ void loadScheduleEvents() {
 }
 
 void saveScheduleEvents() {
+  SD.remove("/scheduler/events.json");
   File f = SD.open("/scheduler/events.json", FILE_WRITE);
   if (!f) {
     Serial.println("[SCHEDULER] Failed to open events.json");
@@ -303,6 +345,20 @@ void playPlaylist(int playlistNum) {
   audio.setVolume(currentMusicVolume);
   audio.connecttoFS(SD, lastPlayedFile.c_str());
   Serial.printf("[PLAYLIST] Started PL%d: %s (vol=%d)\n", playlistNum, firstTrack.c_str(), currentMusicVolume);
+}
+
+void playTrackByName(String filename) {
+  filename.trim();
+  if (filename.length() == 0) return;
+  lastPlayedFile = "/music/" + filename;
+  nowPlayingTrack = filename;
+  currentPlaylistNum = 0;
+  currentPlaylistName = "DIRECT";
+  isMusicPlaying = true;
+  isSpotPlaying = false;
+  audio.setVolume(currentMusicVolume);
+  audio.connecttoFS(SD, lastPlayedFile.c_str());
+  Serial.printf("[PLAY] Direct track: %s (vol=%d)\n", filename.c_str(), currentMusicVolume);
 }
 
 void playSpot(String filename, int volume) {
@@ -499,6 +555,7 @@ bool loadConfig() {
 }
 
 void saveConfig() {
+  SD.remove("/config/system.json");
   File f = SD.open("/config/system.json", FILE_WRITE);
   StaticJsonDocument<2048> doc;
   doc["wifi"]["ssid"] = cfg.ssid; 
@@ -544,9 +601,12 @@ void indexTracks() {
     while(f) {
       if(!f.isDirectory()) {
         String n = f.name();
+        if (n.startsWith("/")) n = n.substring(1);
+        int slash = n.lastIndexOf('/');
+        if (slash >= 0) n = n.substring(slash + 1);
         String shortN = shortenName(n);
         String enc = urlEncode(n);
-        musicListCache += "<div class='row'><span>" + shortN + "</span><button onclick='cmdPlay(\"/api/play?f=" + enc + "\")'>PLAY</button><button class='btn-del' onclick='cmdDel(\"/music/" + enc + "\")'>DEL</button></div>";
+        musicListCache += "<div class='row'><span>" + htmlEscape(shortN) + "</span><button onclick=\"cmdPlay('/api/play?f=" + enc + "')\">PLAY</button><button class='btn-del' onclick=\"cmdDel('/music/" + enc + "')\">DEL</button></div>";
       }
       f = rootMusic.openNextFile();
     }
@@ -559,9 +619,12 @@ void indexTracks() {
     while(f) {
       if(!f.isDirectory()) {
         String n = f.name();
+        if (n.startsWith("/")) n = n.substring(1);
+        int slash = n.lastIndexOf('/');
+        if (slash >= 0) n = n.substring(slash + 1);
         String shortN = shortenName(n);
         String enc = urlEncode(n);
-        spotListCache += "<div class='row'><span>" + shortN + "</span><button onclick='cmdPlay(\"/api/play-spot?f=" + enc + "&vol=20\")'>PLAY</button><button class='btn-del' onclick='cmdDel(\"/spot/" + enc + "\")'>DEL</button></div>";
+        spotListCache += "<div class='row'><span>" + htmlEscape(shortN) + "</span><button onclick=\"cmdPlay('/api/play-spot?f=" + enc + "&vol=" + String(defaultSpotVolume) + "')\">PLAY</button><button class='btn-del' onclick=\"cmdDel('/spot/" + enc + "')\">DEL</button></div>";
       }
       f = rootSpot.openNextFile();
     }
@@ -571,11 +634,11 @@ void indexTracks() {
   spotTriggersCache = "";
   for (int i = 1; i <= 10; i++) {
     String spotFile = findSpotFile(i);
-    String buttonText = spotFile.length() > 0 ? spotFile : String(i);
+    String buttonText = spotFile.length() > 0 ? shortenName(spotFile) : String(i);
     String enc = spotFile.length() > 0 ? urlEncode(spotFile) : "";
     String disabled = spotFile.length() > 0 ? "" : " disabled style='opacity:0.4;'";
-    String onclick = spotFile.length() > 0 ? "onclick='cmdPlay(\"/api/play-spot?f=" + enc + "&vol=" + String(defaultSpotVolume) + "\")'" : "";
-    spotTriggersCache += "<button class='spot-btn' " + onclick + disabled + ">" + buttonText + "</button>";
+    String onclick = spotFile.length() > 0 ? "onclick=\"cmdPlay('/api/play-spot?f=" + enc + "&vol=" + String(defaultSpotVolume) + "')\"" : "";
+    spotTriggersCache += "<button class='spot-btn' " + onclick + disabled + ">" + htmlEscape(buttonText) + "</button>";
   }
 }
 
@@ -618,11 +681,11 @@ String getHeader() {
   
   h += "<script>"
        "function cmdPlay(url){fetch(url).then(r=>{console.log('Play response:',r.status);if(r.ok)setTimeout(()=>location.reload(),100);}).catch(e=>console.error('Play error:',e));}"
-       "function cmdDel(path){if(confirm('Smazat?'))fetch('/api/delete?p='+path).then(r=>{console.log('Delete response:',r.status);if(r.ok)setTimeout(()=>location.reload(),100);}).catch(e=>console.error('Delete error:',e));}"
-       "function openModal(id){document.getElementById(id).style.display='block';}"
-       "function closeModal(id){document.getElementById(id).style.display='none';}"
-       "window.onclick=function(e){if(e.target.classList.contains('modal'))e.target.style.display='none';}"
-       "function toggleAllDays(cb){document.querySelectorAll('.day-cb').forEach(b=>b.checked=cb.checked);}"
+       "function cmdDel(path){if(confirm('Smazat?'))fetch('/api/delete?p='+encodeURIComponent(path)).then(r=>{console.log('Delete response:',r.status);if(r.ok)setTimeout(()=>location.reload(),100);}).catch(e=>console.error('Delete error:',e));}"
+       "function openModal(id){var el=document.getElementById(id);if(el)el.style.display='block';}"
+       "function closeModal(id){var el=document.getElementById(id);if(el)el.style.display='none';}"
+       "window.onclick=function(e){if(e.target.classList&&e.target.classList.contains('modal'))e.target.style.display='none';};"
+       "function toggleAllDays(cb){document.querySelectorAll('.day-cb').forEach(function(b){b.checked=cb.checked;});}"
        "</script></head><body>";
   h += "<div class='sidebar'><div>J</div><a href='/'>DASH</a><a href='/media'>MEDIA</a><a href='/playlists'>PL</a><a href='/scheduler'>SCHED</a><a href='/system'>SYST</a></div>";
   return h;
@@ -635,8 +698,8 @@ String getDashboard() {
   strftime(dS, sizeof(dS), "%d.%m.%Y", &ti);
   String h = getHeader();
   h += "<div class='main'><h1>Jardio SP1</h1><div class='grid'>";
-  h += "<div class='tile'><h2>Čas & IP</h2><div style='font-size:16px;font-weight:bold;color:#fff;'>" + String(tS) + "</div><div style='color:#8b949e;font-size:11px;margin-top:4px;'>" + String(dS) + "<br>" + WiFi.localIP().toString() + "</div></div>";
-  h += "<div class='tile'><h2>Playback</h2><div style='background:#282c34;padding:8px;border-radius:4px;font-size:13px;margin-bottom:6px;'>" + (isMusicPlaying && currentPlaylistNum > 0 ? "PL" + String(currentPlaylistNum) : "Ticho") + "</div><div style='display:flex;gap:4px;'><button onclick='cmdPlay(\"/api/resume\")' style='flex:1;'>PAUSE</button><button onclick='cmdPlay(\"/api/stop\")' style='background:#d73a49;flex:1;'>STOP</button></div></div>";
+  h += "<div class='tile'><h2>Čas & IP</h2><div style='font-size:16px;font-weight:bold;color:#fff;'>" + String(tS) + "</div><div style='color:#8b949e;font-size:11px;margin-top:4px;'>" + String(dS) + "<br>" + (apMode ? String("AP MODE") : WiFi.localIP().toString()) + "</div></div>";
+  h += "<div class='tile'><h2>Playback</h2><div style='background:#282c34;padding:8px;border-radius:4px;font-size:13px;margin-bottom:6px;'>" + (isMusicPlaying ? htmlEscape(nowPlayingTrack.length() ? nowPlayingTrack : String("Playing")) : String("Ticho")) + "</div><div style='display:flex;gap:6px;'><button onclick=\"fetch('/api/resume').then(()=>setTimeout(()=>location.reload(),100))\" style='flex:1;'>PAUSE</button><button onclick=\"fetch('/api/stop').then(()=>setTimeout(()=>location.reload(),100))\" style='flex:1;background:#d73a49;'>STOP</button></div></div>";
   h += "<div class='tile'><h2>Hlasitost</h2><div style='font-size:13px;color:#cfd3d7;'>Hudba: <strong>" + String(currentMusicVolume) + "</strong><br>Spoty: <strong>" + String(currentSpotVolume) + "</strong></div></div>";
   h += "<div class='tile'><h2>SPOTy 1-10</h2>" + spotTriggersCache + "</div>";
   h += "</div></div></body></html>";
@@ -659,7 +722,7 @@ String getPlaylistUI() {
   h += "<div class='main'><h1>Playlisty</h1><div class='tile'><form action='/api/saveplaylists' method='POST'>";
   h += "<div style='display:flex;gap:4px;margin-bottom:8px;flex-wrap:wrap;'>";
   for(int i=1; i<=10; i++) {
-    h += "<label style='font-size:11px;'><input type='checkbox' onchange='toggleAllDays(this)'> " + String(i) + "</label>";
+    h += "<label style='font-size:11px;'><input type='checkbox' onchange='document.querySelectorAll(\"input[name=\\\"pl" + String(i) + "\\\"]\").forEach(cb=>cb.checked=this.checked)'> " + String(i) + "</label>";
   }
   h += "</div>";
   File root = SD.open("/music");
@@ -668,9 +731,12 @@ String getPlaylistUI() {
     while(f) {
       if(!f.isDirectory()) {
         String n = f.name();
+        if (n.startsWith("/")) n = n.substring(1);
+        int slash = n.lastIndexOf('/');
+        if (slash >= 0) n = n.substring(slash + 1);
         String shortN = shortenName(n);
         String enc = urlEncode(n);
-        h += "<div class='row'><span>" + shortN + "</span><div style='display:flex;gap:3px;'>";
+        h += "<div class='row'><span>" + htmlEscape(shortN) + "</span><div style='display:flex;gap:3px;'>";
         for(int i=1; i<=10; i++) {
           bool checked = isInPlaylist(n, i);
           h += "<label style='font-size:10px;'><input type='checkbox' name='pl" + String(i) + "' value='" + enc + "' " + (checked?"checked":"") + ">" + String(i) + "</label>";
@@ -702,7 +768,7 @@ String getSchedulerUI() {
         if (eventH != hour) continue;
         String typeClass = (evt.type == "playlist") ? "evt-pl" : (evt.type == "volume") ? "evt-vol" : "evt-sp";
         String typeShort = (evt.type == "playlist") ? "PL" + String(evt.target) : (evt.type == "volume") ? "V" + String(evt.volume) : "S" + String(evt.target);
-        h += "<div class='evt-box " + typeClass + "' onclick=\"openModal('editModal_" + evt.id + "')\" title='" + evt.time + "'>" + typeShort + "</div>";
+        h += "<div class='evt-box " + typeClass + "' onclick=\"openModal('editModal_" + jsQuote(evt.id) + "')\" title='" + htmlEscape(evt.time) + "'>" + htmlEscape(typeShort) + "</div>";
       }
       h += "</td>";
     }
@@ -710,7 +776,6 @@ String getSchedulerUI() {
   }
   h += "</table></div>";
   
-  // CREATE MODAL
   h += "<div id='createModal' class='modal'><div class='modal-box'><span class='close' onclick=\"closeModal('createModal')\">&times;</span><h2>New Event</h2><form id='createForm'>";
   h += "<label>Day:</label><select name='day' required>";
   String dayNames[] = {"Pondělí","Úterý","Středa","Čtvrtek","Pátek","Sobota","Neděle"};
@@ -727,20 +792,18 @@ String getSchedulerUI() {
   h += "</select><label style='margin-top:6px;display:block;'>Repeat:</label><select name='repeat'>";
   for(int i=1;i<=5;i++) h += "<option value='" + String(i) + "'>" + String(i) + "x</option>";
   h += "</select><label style='margin-top:6px;display:block;'>Volume:</label><input type='number' name='volume' min='0' max='21' value='20'></div>";
-  h += "<div class='modal-btns'><button type='button' onclick='saveNewEvent()' style='background:#28a745;'>SAVE</button><button type='button' onclick=\"closeModal('createModal')\" style='background:#6c757d;'>CANCEL</button></div></form></div></div>";
+  h += "<div class='modal-btns'><button type='button' onclick='saveNewEvent()' style='background:#28a745;'>SAVE</button><button type='button' onclick=\"closeModal('createModal')\" style='background:#6c757d;'>CLOSE</button></div></form></div></div>";
   
-  // EDIT MODALS
   for(int i = 0; i < scheduleEventCount; i++) {
     ScheduleEvent& evt = scheduleEvents[i];
-    h += "<div id='editModal_" + evt.id + "' class='modal'><div class='modal-box'><span class='close' onclick=\"closeModal('editModal_" + evt.id + "')\">&times;</span><h2>Edit Event</h2><form id='editForm_" + evt.id + "'>";
+    h += "<div id='editModal_" + htmlEscape(evt.id) + "' class='modal'><div class='modal-box'><span class='close' onclick=\"closeModal('editModal_" + jsQuote(evt.id) + "')\">&times;</span><h2>Edit Event</h2><form id='editForm_" + htmlEscape(evt.id) + "'>";
     h += "<label>Day:</label><select name='day' required>";
     for(int d=0;d<7;d++) {
       String sel = (d == evt.day) ? "selected" : "";
       h += "<option value='" + String(d) + "' " + sel + ">" + dayNames[d] + "</option>";
     }
-    h += "</select><label style='margin-top:6px;display:block;'>Time:</label><input type='time' name='time' value='" + evt.time + "' required>";
-    h += "<label style='margin-top:6px;display:block;'>Type:</label><select disabled>";
-    h += "<option>" + evt.type + "</option></select>";
+    h += "</select><label style='margin-top:6px;display:block;'>Time:</label><input type='time' name='time' value='" + htmlEscape(evt.time) + "' required>";
+    h += "<label style='margin-top:6px;display:block;'>Type:</label><select disabled><option>" + htmlEscape(evt.type) + "</option></select>";
     if(evt.type == "playlist") {
       h += "<label style='margin-top:6px;display:block;'>Playlist:</label><select name='target'>";
       for(int t=1;t<=10;t++) h += "<option value='" + String(t) + "' " + (t==evt.target?"selected":"") + ">PL " + String(t) + "</option>";
@@ -754,26 +817,25 @@ String getSchedulerUI() {
       for(int r=1;r<=5;r++) h += "<option value='" + String(r) + "' " + (r==evt.repeat?"selected":"") + ">" + String(r) + "x</option>";
       h += "</select><label style='margin-top:6px;display:block;'>Volume:</label><input type='number' name='volume' min='0' max='21' value='" + String(evt.volume) + "'>";
     }
-    h += "<div class='modal-btns'><button type='button' onclick=\"saveEditEvent('" + evt.id + "')\" style='background:#28a745;'>SAVE</button>";
-    h += "<button type='button' onclick=\"copyEvent('" + evt.id + "')\" style='background:#17a2b8;'>COPY</button>";
-    h += "<button type='button' onclick=\"deleteEvent('" + evt.id + "')\" style='background:#dc3545;'>DEL</button>";
-    h += "<button type='button' onclick=\"closeModal('editModal_" + evt.id + "')\" style='background:#6c757d;'>CLOSE</button></div></form></div></div>";
+    h += "<div class='modal-btns'><button type='button' onclick=\"saveEditEvent('" + jsQuote(evt.id) + "')\" style='background:#28a745;'>SAVE</button>";
+    h += "<button type='button' onclick=\"copyEvent('" + jsQuote(evt.id) + "')\" style='background:#17a2b8;'>COPY</button>";
+    h += "<button type='button' onclick=\"deleteEvent('" + jsQuote(evt.id) + "')\" style='background:#dc3545;'>DEL</button>";
+    h += "<button type='button' onclick=\"closeModal('editModal_" + jsQuote(evt.id) + "')\" style='background:#6c757d;'>CLOSE</button></div></form></div></div>";
   }
   
-  // COPY MODAL
   h += "<div id='copyModal' class='modal'><div class='modal-box'><span class='close' onclick=\"closeModal('copyModal')\">&times;</span><h2>Copy to Days</h2><div class='checkbox-list'>";
   h += "<label><input type='checkbox' onchange='toggleAllDays(this)'> <strong>ALL</strong></label>";
   for(int d=0;d<7;d++) h += "<label><input type='checkbox' class='day-cb' value='" + String(d) + "'> " + dayNames[d] + "</label>";
-  h += "</div><div class='modal-btns'><button type='button' onclick='confirmCopy()' style='background:#28a745;'>COPY</button><button type='button' onclick=\"closeModal('copyModal')\" style='background:#6c757d;'>CANCEL</button></div></div></div>";
+  h += "</div><div class='modal-btns'><button type='button' onclick='confirmCopy()' style='background:#28a745;'>COPY</button><button type='button' onclick=\"closeModal('copyModal')\" style='background:#6c757d;'>CLOSE</button></div></div></div>";
   
   h += "<script>";
   h += "let copyEventId='';";
-  h += "function updateForm(){let t=document.querySelector('select[name=\"type\"]').value;document.getElementById('playlistFields').style.display=t==='playlist'?'block':'none';document.getElementById('volumeFields').style.display=t==='volume'?'block':'none';document.getElementById('spotFields').style.display=t==='spot'?'block':'none';}";
-  h += "function saveNewEvent(){let f=document.getElementById('createForm');let d=new FormData(f);fetch('/api/event/add',{method:'POST',body:new URLSearchParams(d)}).then(r=>{console.log('Add:',r.status);if(r.ok||r.status===303)setTimeout(()=>location.reload(),100);}).catch(e=>console.error('Error:',e));}";
-  h += "function saveEditEvent(id){let f=document.getElementById('editForm_'+id);let d=new FormData(f);fetch('/api/event/edit?id='+id,{method:'POST',body:new URLSearchParams(d)}).then(r=>{console.log('Edit:',r.status);if(r.ok||r.status===303)setTimeout(()=>location.reload(),100);}).catch(e=>console.error('Error:',e));}";
-  h += "function deleteEvent(id){if(confirm('Delete?'))fetch('/api/event/delete?id='+id).then(r=>{console.log('Del:',r.status);if(r.ok)setTimeout(()=>location.reload(),100);}).catch(e=>console.error('Error:',e));}";
+  h += "function updateForm(){var t=document.querySelector('#createForm select[name=type]').value;document.getElementById('playlistFields').style.display=t==='playlist'?'block':'none';document.getElementById('volumeFields').style.display=t==='volume'?'block':'none';document.getElementById('spotFields').style.display=t==='spot'?'block':'none';}";
+  h += "function saveNewEvent(){var f=document.getElementById('createForm');var d=new FormData(f);fetch('/api/event/add',{method:'POST',body:new URLSearchParams(d)}).then(r=>{console.log('Add:',r.status);if(r.ok)setTimeout(()=>location.reload(),100);}).catch(e=>console.error('Add error:',e));}";
+  h += "function saveEditEvent(id){var f=document.getElementById('editForm_'+id);var d=new FormData(f);fetch('/api/event/edit?id='+encodeURIComponent(id),{method:'POST',body:new URLSearchParams(d)}).then(r=>{console.log('Edit:',r.status);if(r.ok)setTimeout(()=>location.reload(),100);}).catch(e=>console.error('Edit error:',e));}";
+  h += "function deleteEvent(id){if(confirm('Delete?'))fetch('/api/event/delete?id='+encodeURIComponent(id)).then(r=>{console.log('Del:',r.status);if(r.ok)setTimeout(()=>location.reload(),100);}).catch(e=>console.error('Delete error:',e));}";
   h += "function copyEvent(id){copyEventId=id;openModal('copyModal');}";
-  h += "function confirmCopy(){let days=[];document.querySelectorAll('.day-cb:checked').forEach(c=>days.push(c.value));fetch('/api/event/copy?id='+copyEventId+'&days='+days.join(',')).then(r=>{console.log('Copy:',r.status);if(r.ok||r.status===303)setTimeout(()=>location.reload(),100);}).catch(e=>console.error('Error:',e));}";
+  h += "function confirmCopy(){var days=[];document.querySelectorAll('.day-cb:checked').forEach(function(c){days.push(c.value);});fetch('/api/event/copy?id='+encodeURIComponent(copyEventId)+'&days='+encodeURIComponent(days.join(','))).then(r=>{console.log('Copy:',r.status);if(r.ok)setTimeout(()=>location.reload(),100);}).catch(e=>console.error('Copy error:',e));}";
   h += "updateForm();";
   h += "</script>";
   
@@ -785,14 +847,14 @@ String getSystemUI() {
   String h = getHeader();
   h += "<div class='main'><h1>System</h1><div class='grid'>";
   h += "<div class='tile'><h2>Network</h2><form action='/api/net' method='POST'><label>Mode:</label><select name='dhcp'><option value='1' " + String(cfg.dhcp?"selected":"") + ">DHCP</option><option value='0' " + String(!cfg.dhcp?"selected":"") + ">Static</option></select>";
-  h += "<label style='margin-top:6px;display:block;'>IP:</label><input name='ip' value='" + cfg.ip + "'><label style='margin-top:6px;display:block;'>GW:</label><input name='gw' value='" + cfg.gw + "'><label style='margin-top:6px;display:block;'>Mask:</label><input name='mask' value='" + cfg.mask + "'><label style='margin-top:6px;display:block;'>DNS:</label><input name='dns' value='" + cfg.dns + "'>";
+  h += "<label style='margin-top:6px;display:block;'>IP:</label><input name='ip' value='" + htmlEscape(cfg.ip) + "'><label style='margin-top:6px;display:block;'>GW:</label><input name='gw' value='" + htmlEscape(cfg.gw) + "'><label style='margin-top:6px;display:block;'>MASK:</label><input name='mask' value='" + htmlEscape(cfg.mask) + "'><label style='margin-top:6px;display:block;'>DNS:</label><input name='dns' value='" + htmlEscape(cfg.dns) + "'>";
   h += "<button type='submit' style='width:100%;margin-top:6px;'>SAVE</button></form></div>";
   h += "<div class='tile'><h2>Volume</h2><form action='/api/vol' method='POST'><label>Music:</label><select name='musicvol'>";
   for(int i=0;i<=21;i++) h += "<option value='" + String(i) + "' " + (defaultMusicVolume==i?"selected":"") + ">" + String(i) + "</option>";
   h += "</select><label style='margin-top:6px;display:block;'>Spot:</label><select name='spotvol'>";
   for(int i=0;i<=21;i++) h += "<option value='" + String(i) + "' " + (defaultSpotVolume==i?"selected":"") + ">" + String(i) + "</option>";
   h += "</select><button type='submit' style='width:100%;margin-top:6px;'>SAVE</button></form></div>";
-  h += "<div class='tile'><h2>Time</h2><form action='/api/time' method='POST'><label>NTP:</label><input name='ntp' value='" + cfg.ntpServer + "'><label style='margin-top:6px;display:block;'>TZ:</label><input name='tz' value='" + cfg.tz + "'><button type='submit' style='width:100%;margin-top:6px;'>SAVE</button></form></div>";
+  h += "<div class='tile'><h2>Time</h2><form action='/api/time' method='POST'><label>NTP:</label><input name='ntp' value='" + htmlEscape(cfg.ntpServer) + "'><label style='margin-top:6px;display:block;'>TZ:</label><input name='tz' value='" + htmlEscape(cfg.tz) + "'><button type='submit' style='width:100%;margin-top:6px;'>SAVE</button></form></div>";
   h += "<div class='tile'><button onclick=\"if(confirm('Restart?'))fetch('/api/restart').then(()=>setTimeout(()=>location.reload(),500));\" style='background:#d73a49;width:100%;padding:10px;'>RESTART</button></div>";
   h += "</div></div></body></html>";
   return h;
@@ -924,7 +986,7 @@ void handleCopyEvent() {
     for (int i = 0; i <= daysStr.length(); i++) {
       char c = (i < daysStr.length()) ? daysStr[i] : ',';
       if (c == ',') {
-        if (currentNum.length() > 0) {
+        if (currentNum.length() > 0 && dayCount < 7) {
           days[dayCount++] = currentNum.toInt();
           currentNum = "";
         }
@@ -1020,17 +1082,30 @@ void setup() {
   server.on("/api/event/delete", handleDeleteEvent);
   server.on("/api/event/copy", handleCopyEvent);
 
-  server.on("/api/play", []() { if (server.hasArg("f")) { String fName = urlDecode(server.arg("f")); playPlaylist(1); } server.send(200); });
-  server.on("/api/play-spot", []() { if (server.hasArg("f")) { String fName = urlDecode(server.arg("f")); int vol = server.hasArg("vol") ? server.arg("vol").toInt() : defaultSpotVolume; playSpot(fName, vol); } server.send(200); });
-  server.on("/api/stop", []() { audio.stopSong(); isSpotPlaying = false; isMusicPlaying = false; currentPlaylistNum = 0; server.send(200); });
+  server.on("/api/play", []() {
+    if (server.hasArg("f")) {
+      String fName = urlDecode(server.arg("f"));
+      playTrackByName(fName);
+    }
+    server.send(200);
+  });
+  server.on("/api/play-spot", []() {
+    if (server.hasArg("f")) {
+      String fName = urlDecode(server.arg("f"));
+      int vol = server.hasArg("vol") ? server.arg("vol").toInt() : defaultSpotVolume;
+      playSpot(fName, vol);
+    }
+    server.send(200);
+  });
+  server.on("/api/stop", []() { audio.stopSong(); isSpotPlaying = false; isMusicPlaying = false; currentPlaylistNum = 0; nowPlayingTrack = ""; server.send(200); });
   server.on("/api/resume", []() { audio.pauseResume(); server.send(200); });
-  server.on("/api/vol", []() { if(server.hasArg("musicvol")) { defaultMusicVolume = server.arg("musicvol").toInt(); currentMusicVolume = defaultMusicVolume; cfg.musicVol = defaultMusicVolume; } if(server.hasArg("spotvol")) { defaultSpotVolume = server.arg("spotvol").toInt(); currentSpotVolume = defaultSpotVolume; cfg.spotVol = defaultSpotVolume; } saveConfig(); server.sendHeader("Location", "/system"); server.send(303); });
-  server.on("/api/time", []() { if(server.hasArg("ntp")) cfg.ntpServer = server.arg("ntp"); if(server.hasArg("tz")) cfg.tz = server.arg("tz"); saveConfig(); configTime(0, 0, cfg.ntpServer.c_str()); setenv("TZ", cfg.tz.c_str(), 1); tzset(); server.sendHeader("Location", "/system"); server.send(303); });
-  server.on("/api/net", []() { cfg.dhcp = (server.arg("dhcp") == "1"); cfg.ip = server.arg("ip"); cfg.gw = server.arg("gw"); cfg.mask = server.arg("mask"); cfg.dns = server.arg("dns"); saveConfig(); server.sendHeader("Location", "/system"); server.send(303); });
+  server.on("/api/vol", HTTP_POST, []() { if(server.hasArg("musicvol")) { defaultMusicVolume = server.arg("musicvol").toInt(); currentMusicVolume = defaultMusicVolume; cfg.musicVol = defaultMusicVolume; } if(server.hasArg("spotvol")) { defaultSpotVolume = server.arg("spotvol").toInt(); currentSpotVolume = defaultSpotVolume; cfg.spotVol = defaultSpotVolume; } saveConfig(); server.sendHeader("Location", "/system"); server.send(303); });
+  server.on("/api/time", HTTP_POST, []() { if(server.hasArg("ntp")) cfg.ntpServer = server.arg("ntp"); if(server.hasArg("tz")) cfg.tz = server.arg("tz"); saveConfig(); configTime(0, 0, cfg.ntpServer.c_str()); setenv("TZ", cfg.tz.c_str(), 1); tzset(); server.sendHeader("Location", "/system"); server.send(303); });
+  server.on("/api/net", HTTP_POST, []() { cfg.dhcp = (server.arg("dhcp") == "1"); cfg.ip = server.arg("ip"); cfg.gw = server.arg("gw"); cfg.mask = server.arg("mask"); cfg.dns = server.arg("dns"); saveConfig(); server.sendHeader("Location", "/system"); server.send(303); });
   server.on("/api/restart", []() { server.send(200); delay(500); ESP.restart(); });
   server.on("/api/upload/music", HTTP_POST, [](){ indexTracks(); server.sendHeader("Location", "/media"); server.send(303); }, handleFileUpload);
   server.on("/api/upload/spot", HTTP_POST, [](){ indexTracks(); server.sendHeader("Location", "/media"); server.send(303); }, handleFileUpload);
-  server.on("/api/delete", []() { if (server.hasArg("p")) { SD.remove(server.arg("p")); indexTracks(); } server.send(200); });
+  server.on("/api/delete", []() { if (server.hasArg("p")) { SD.remove(urlDecode(server.arg("p"))); indexTracks(); } server.send(200); });
 
   server.begin(); 
   Serial.println("[OK] Web server started");
