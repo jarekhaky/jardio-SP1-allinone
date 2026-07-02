@@ -10,9 +10,9 @@
 #include <Audio.h>
 #include "time.h"
 
-#define SD_CS 4 
-#define SD_MOSI 5 
-#define SD_SCK 6 
+#define SD_CS 4
+#define SD_MOSI 5
+#define SD_SCK 6
 #define SD_MISO 7
 #define I2S_BCLK 17
 #define I2S_LRC 16
@@ -109,7 +109,7 @@ struct Config {
   int musicVol = 15;
   int spotVol = 20;
   String ntpServer = "pool.ntp.org";
-  String tz = "CET-1CEST,M3.5.0,M10.5.0/3"; 
+  String tz = "CET-1CEST,M3.5.0,M10.5.0/3";
 } cfg;
 
 bool apMode = false;
@@ -496,14 +496,14 @@ void playPlaylist(int playlistNum) {
     firstTrack.trim();
   }
   f.close();
-  
+
   if (firstTrack.length() == 0) {
     Serial.printf("[PLAYLIST] Playlist %d is empty\n", playlistNum);
     isMusicPlaying = false;
     currentPlaylistNum = 0;
     return;
   }
-  
+
   lastPlayedFile = "/music/" + firstTrack;
   nowPlayingTrack = firstTrack;
   currentPlaylistNum = playlistNum;
@@ -700,7 +700,7 @@ bool loadConfig() {
   if (!f) return false;
   StaticJsonDocument<2048> doc;
   if (deserializeJson(doc, f)) { f.close(); return false; }
-  cfg.ssid = doc["wifi"]["ssid"] | ""; 
+  cfg.ssid = doc["wifi"]["ssid"] | "";
   cfg.pass = doc["wifi"]["pass"] | "";
   cfg.dhcp = doc["net"]["dhcp"] | true;
   cfg.ip = doc["net"]["ip"] | "192.168.1.100";
@@ -716,7 +716,7 @@ bool loadConfig() {
   defaultSpotVolume = cfg.spotVol;
   currentMusicVolume = cfg.musicVol;
   currentSpotVolume = cfg.spotVol;
-  f.close(); 
+  f.close();
   return true;
 }
 
@@ -724,19 +724,19 @@ void saveConfig() {
   SD.remove("/config/system.json");
   File f = SD.open("/config/system.json", FILE_WRITE);
   StaticJsonDocument<2048> doc;
-  doc["wifi"]["ssid"] = cfg.ssid; 
+  doc["wifi"]["ssid"] = cfg.ssid;
   doc["wifi"]["pass"] = cfg.pass;
-  doc["net"]["dhcp"] = cfg.dhcp; 
+  doc["net"]["dhcp"] = cfg.dhcp;
   doc["net"]["ip"] = cfg.ip;
-  doc["net"]["gw"] = cfg.gw; 
-  doc["net"]["mask"] = cfg.mask; 
+  doc["net"]["gw"] = cfg.gw;
+  doc["net"]["mask"] = cfg.mask;
   doc["net"]["dns"] = cfg.dns;
   doc["mdns"] = cfg.mdns;
   doc["volume"]["music"] = cfg.musicVol;
   doc["volume"]["spot"] = cfg.spotVol;
   doc["time"]["ntp"] = cfg.ntpServer;
   doc["time"]["tz"] = cfg.tz;
-  serializeJson(doc, f); 
+  serializeJson(doc, f);
   f.close();
 }
 
@@ -760,7 +760,7 @@ void indexTracks() {
   musicListCache = "";
   spotListCache = "";
   spotTriggersCache = "";
-  
+
   File rootMusic = SD.open("/music");
   if (rootMusic) {
     File f = rootMusic.openNextFile();
@@ -778,7 +778,7 @@ void indexTracks() {
     }
     rootMusic.close();
   }
-  
+
   File rootSpot = SD.open("/spot");
   if (rootSpot) {
     File f = rootSpot.openNextFile();
@@ -796,7 +796,7 @@ void indexTracks() {
     }
     rootSpot.close();
   }
-  
+
   spotTriggersCache = "";
   for (int i = 1; i <= 10; i++) {
     String spotFile = findSpotFile(i);
@@ -844,7 +844,7 @@ String getHeader() {
        ".checkbox-list label{display:block;padding:3px;font-size:11px;}"
        ".checkbox-list input{margin-right:3px;}"
        "</style>";
-  
+
   h += "<script>"
        "function cmdPlay(url){fetch(url).then(r=>{console.log('Play response:',r.status);if(r.ok)setTimeout(()=>location.reload(),100);}).catch(e=>console.error('Play error:',e));}"
        "function cmdDel(path){if(confirm('Smazat?'))fetch('/api/delete?p='+encodeURIComponent(path)).then(r=>{console.log('Delete response:',r.status);if(r.ok)setTimeout(()=>location.reload(),100);}).catch(e=>console.error('Delete error:',e));}"
@@ -922,7 +922,7 @@ String getSchedulerUI() {
   h += "<div class='main'><h1>Scheduler</h1><p style='color:#8b949e;font-size:10px;margin-bottom:6px;'>🟢 PL | 🟡 Vol | 🔴 Spot</p>";
   h += "<button onclick=\"openModal('createModal')\" style='background:#28a745;padding:7px 10px;margin-bottom:6px;'>+ NEW</button>";
   h += "<div style='overflow-x:auto;'><table><tr><th style='width:30px;'>H</th><th>Po</th><th>Út</th><th>St</th><th>Čt</th><th>Pá</th><th>So</th><th>Ne</th></tr>";
-  
+
   for(int hour = 0; hour <= 23; hour++) {
     h += "<tr><td style='font-weight:bold;background:#161a23;'>" + String(hour) + "</td>";
     for(int day = 0; day < 7; day++) {
@@ -941,7 +941,7 @@ String getSchedulerUI() {
     h += "</tr>";
   }
   h += "</table></div>";
-  
+
   h += "<div id='createModal' class='modal'><div class='modal-box'><span class='close' onclick=\"closeModal('createModal')\">&times;</span><h2>New Event</h2><form id='createForm'>";
   h += "<label>Day:</label><select name='day' required>";
   String dayNames[] = {"Pondělí","Úterý","Středa","Čtvrtek","Pátek","Sobota","Neděle"};
@@ -960,7 +960,7 @@ String getSchedulerUI() {
   for(int i=1;i<=5;i++) h += "<option value='" + String(i) + "'>" + String(i) + "x</option>";
   h += "</select><label style='margin-top:6px;display:block;'>Volume:</label><input type='number' name='spotVolume' min='0' max='21' value='20'></div>";
   h += "<div class='modal-btns'><button type='button' onclick='saveNewEvent()' style='background:#28a745;'>SAVE</button><button type='button' onclick=\"closeModal('createModal')\" style='background:#6c757d;'>CLOSE</button></div></form></div></div>";
-  
+
   for(int i = 0; i < scheduleEventCount; i++) {
     ScheduleEvent& evt = scheduleEvents[i];
     h += "<div id='editModal_" + htmlEscape(evt.id) + "' class='modal'><div class='modal-box'><span class='close' onclick=\"closeModal('editModal_" + jsQuote(evt.id) + "')\">&times;</span><h2>Edit Event</h2><form id='editForm_" + htmlEscape(evt.id) + "'>";
@@ -991,12 +991,12 @@ String getSchedulerUI() {
     h += "<button type='button' onclick=\"deleteEvent('" + jsQuote(evt.id) + "')\" style='background:#dc3545;'>DEL</button>";
     h += "<button type='button' onclick=\"closeModal('editModal_" + jsQuote(evt.id) + "')\" style='background:#6c757d;'>CLOSE</button></div></form></div></div>";
   }
-  
+
   h += "<div id='copyModal' class='modal'><div class='modal-box'><span class='close' onclick=\"closeModal('copyModal')\">&times;</span><h2>Copy to Days</h2><div class='checkbox-list'>";
   h += "<label><input type='checkbox' onchange='toggleAllDays(this)'> <strong>ALL</strong></label>";
   for(int d=0;d<7;d++) h += "<label><input type='checkbox' class='day-cb' value='" + String(d) + "'> " + dayNames[d] + "</label>";
   h += "</div><div class='modal-btns'><button type='button' onclick='confirmCopy()' style='background:#28a745;'>COPY</button><button type='button' onclick=\"closeModal('copyModal')\" style='background:#6c757d;'>CLOSE</button></div></div></div>";
-  
+
   h += "<script>";
   h += "let copyEventId='';";
   h += "function updateForm(){var t=document.querySelector('#createForm select[name=type]').value;var isSpot=t==='spot';document.getElementById('playlistFields').style.display=t==='playlist'?'block':'none';document.getElementById('volumeFields').style.display=t==='volume'?'block':'none';document.getElementById('spotFields').style.display=isSpot?'block':'none';document.getElementById('endTimeRow').style.display=isSpot?'none':'block';document.querySelector('#createForm input[name=endTime]').required=!isSpot;}";
@@ -1007,7 +1007,7 @@ String getSchedulerUI() {
   h += "function confirmCopy(){var days=[];document.querySelectorAll('.day-cb:checked').forEach(function(c){days.push(c.value);});fetch('/api/event/copy?id='+encodeURIComponent(copyEventId)+'&days='+encodeURIComponent(days.join(','))).then(r=>{console.log('Copy:',r.status);if(r.ok)setTimeout(()=>location.reload(),100);}).catch(e=>console.error('Copy error:',e));}";
   h += "updateForm();";
   h += "</script>";
-  
+
   h += "</div></body></html>";
   return h;
 }
@@ -1029,8 +1029,8 @@ String getSystemUI() {
   return h;
 }
 
-String getSetupUI() { 
-  return "<h1 style='text-align:center;margin-top:50px;'>Setup Mode<br>Connect to: Jardio-SP1 / admin123</h1>"; 
+String getSetupUI() {
+  return "<h1 style='text-align:center;margin-top:50px;'>Setup Mode<br>Connect to: Jardio-SP1 / admin123</h1>";
 }
 
 // ========== REQUEST HANDLERS ==========
@@ -1263,11 +1263,11 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n\n[BOOT] Jardio OS v5.6.7.11 starting...");
-  
+
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  if (!SD.begin(SD_CS, sdSPI, 20000000)) { 
+  if (!SD.begin(SD_CS, sdSPI, 20000000)) {
     Serial.println("[ERROR] SD card init FAILED!");
-    while(1) delay(1000); 
+    while(1) delay(1000);
   }
   Serial.println("[OK] SD card initialized");
 
@@ -1284,26 +1284,26 @@ void setup() {
   if (cfg.ssid.length() > 0) {
     WiFi.mode(WIFI_STA);
     if (!cfg.dhcp) {
-      IPAddress ip, gw, nm, d1; 
+      IPAddress ip, gw, nm, d1;
       ip.fromString(cfg.ip); gw.fromString(cfg.gw); nm.fromString(cfg.mask); d1.fromString(cfg.dns);
       WiFi.config(ip, gw, nm, d1);
     }
     WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
-    unsigned long st = millis(); 
+    unsigned long st = millis();
     while (WiFi.status() != WL_CONNECTED && millis()-st < 8000) delay(500);
   }
 
-  if (WiFi.status() != WL_CONNECTED) { 
-    apMode = true; 
-    WiFi.mode(WIFI_AP); 
-    WiFi.softAP("Jardio-SP1", "admin123"); 
+  if (WiFi.status() != WL_CONNECTED) {
+    apMode = true;
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("Jardio-SP1", "admin123");
     Serial.println("[WIFI] AP Mode: Jardio-SP1 / admin123");
-  } else { 
+  } else {
     Serial.printf("[WIFI] Connected: %s - IP: %s\n", cfg.ssid.c_str(), WiFi.localIP().toString().c_str());
-    MDNS.begin(cfg.mdns.c_str()); 
-    configTime(0, 0, cfg.ntpServer.c_str()); 
-    setenv("TZ", cfg.tz.c_str(), 1); 
-    tzset(); 
+    MDNS.begin(cfg.mdns.c_str());
+    configTime(0, 0, cfg.ntpServer.c_str());
+    setenv("TZ", cfg.tz.c_str(), 1);
+    tzset();
   }
 
   audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
@@ -1351,7 +1351,7 @@ void setup() {
   server.on("/api/upload/spot", HTTP_POST, [](){ indexTracks(); server.sendHeader("Location", "/media"); server.send(303); }, handleFileUpload);
   server.on("/api/delete", []() { if (server.hasArg("p")) { SD.remove(urlDecode(server.arg("p"))); indexTracks(); } server.send(200); });
 
-  server.begin(); 
+  server.begin();
   Serial.println("[OK] Web server started");
   Serial.println("[BOOT] Jardio OS v5.6.7.11 READY!");
 }
