@@ -18,6 +18,8 @@
 #define I2S_LRC 16
 #define I2S_DOUT 15
 
+const char* FIRMWARE_VERSION = "v5.6.7.11";
+
 // ========== EVENT STRUCTURE ==========
 struct ScheduleEvent {
   String id;
@@ -427,7 +429,7 @@ void saveScheduleEvents() {
   }
 
   DynamicJsonDocument doc(32768);
-  doc["version"] = "v5.6.7.11";
+  doc["version"] = FIRMWARE_VERSION;
   JsonArray arr = doc.createNestedArray("events");
   for (int i = 0; i < scheduleEventCount; i++) {
     JsonObject obj = arr.createNestedObject();
@@ -435,7 +437,7 @@ void saveScheduleEvents() {
     obj["day"] = scheduleEvents[i].day;
     obj["startTime"] = scheduleEvents[i].startTime;
     if (scheduleEvents[i].type != "spot") obj["endTime"] = scheduleEvents[i].endTime;
-    obj["time"] = scheduleEvents[i].startTime;
+    obj["time"] = scheduleEvents[i].startTime; // Legacy compatibility for older loaders expecting a single time field.
     obj["type"] = scheduleEvents[i].type;
     obj["target"] = scheduleEvents[i].target;
     obj["repeat"] = scheduleEvents[i].repeat;
@@ -863,7 +865,7 @@ String getDashboard() {
   strftime(tS, sizeof(tS), "%H:%M:%S", &ti);
   strftime(dS, sizeof(dS), "%d.%m.%Y", &ti);
   String h = getHeader();
-  h += "<div class='main'><h1>Jardio SP1 <span style='font-size:12px;color:#8b949e;'>v5.6.7.11</span></h1><div class='grid'>";
+  h += "<div class='main'><h1>Jardio SP1 <span style='font-size:12px;color:#8b949e;'>" + String(FIRMWARE_VERSION) + "</span></h1><div class='grid'>";
   h += "<div class='tile'><h2>Čas & IP</h2><div style='font-size:16px;font-weight:bold;color:#fff;'>" + String(tS) + "</div><div style='color:#8b949e;font-size:11px;margin-top:4px;'>" + String(dS) + "<br>" + (apMode ? String("AP MODE") : WiFi.localIP().toString()) + "</div></div>";
   h += "<div class='tile'><h2>Playback</h2><div style='background:#282c34;padding:8px;border-radius:4px;font-size:13px;margin-bottom:6px;'>" + (isMusicPlaying ? htmlEscape(nowPlayingTrack.length() ? nowPlayingTrack : String("Playing")) : String("Ticho")) + "</div><div style='display:flex;gap:6px;'><button onclick=\"fetch('/api/resume').then(()=>setTimeout(()=>location.reload(),100))\" style='flex:1;'>PAUSE</button><button onclick=\"fetch('/api/stop').then(()=>setTimeout(()=>location.reload(),100))\" style='flex:1;background:#d73a49;'>STOP</button></div></div>";
   h += "<div class='tile'><h2>Hlasitost</h2><div style='font-size:13px;color:#cfd3d7;'>Hudba: <strong>" + String(currentMusicVolume) + "</strong><br>Spoty: <strong>" + String(currentSpotVolume) + "</strong></div></div>";
@@ -1262,7 +1264,7 @@ void handleCopyEvent() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n[BOOT] Jardio OS v5.6.7.11 starting...");
+  Serial.printf("\n\n[BOOT] Jardio OS %s starting...\n", FIRMWARE_VERSION);
 
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if (!SD.begin(SD_CS, sdSPI, 20000000)) {
@@ -1353,7 +1355,7 @@ void setup() {
 
   server.begin();
   Serial.println("[OK] Web server started");
-  Serial.println("[BOOT] Jardio OS v5.6.7.11 READY!");
+  Serial.printf("[BOOT] Jardio OS %s READY!\n", FIRMWARE_VERSION);
 }
 
 void loop() {
