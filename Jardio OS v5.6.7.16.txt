@@ -9,6 +9,7 @@
 #include <ArduinoJson.h>
 #include <Audio.h>
 #include "time.h"
+#include "esp32-hal-rgb-led.h"   // built-in ESP32 RGB LED helper (no Adafruit dependency)
 
 #define SD_CS 4
 #define SD_MOSI 5
@@ -17,6 +18,9 @@
 #define I2S_BCLK 17
 #define I2S_LRC 16
 #define I2S_DOUT 15
+
+// ===== WS2812 STATUS LED =====
+#define STATUS_LED_PIN 48
 
 const char* FIRMWARE_VERSION = "v5.6.7.16";
 
@@ -82,6 +86,16 @@ bool playTrackFromCurrentPlaylistIndex(int index);
 bool playNextTrackInCurrentPlaylist(bool wrapIfNeeded = true);
 void setPlaylistModeFromArgs();
 
+// LED helpers
+void ledInit();
+void ledSetRGB(uint8_t r, uint8_t g, uint8_t b);
+void ledOff();
+void ledSetBootError();
+void ledSetWifiConnecting();
+void ledSetApMode();
+void ledSetReadyConnected();
+void ledUpdate();
+
 // ========== GLOBAL VARIABLES ==========
 Audio audio;
 WebServer server(80);        // UI only
@@ -136,6 +150,18 @@ int currentPlaylistTrackIndex = -1;
 int lastTrackIndexPerPlaylist[11];
 int rngSeedReady = 0;
 
+// LED runtime state
+enum LedState {
+  LED_OFF = 0,
+  LED_BOOT_ERROR_RED_SOLID,
+  LED_WIFI_CONNECTING_BLUE_FAST,
+  LED_AP_MODE_BLUE_SLOW,
+  LED_READY_GREEN_SOLID
+};
+LedState ledState = LED_OFF;
+unsigned long ledLastToggleMs = 0;
+bool ledBlinkOn = false;
+
 struct Config {
   String ssid = "";
   String pass = "";
@@ -150,6 +176,74 @@ struct Config {
   String ntpServer = "pool.ntp.org";
   String tz = "CET-1CEST,M3.5.0,M10.5.0/3";
 } cfg;
+
+// ========== LED FUNCTIONS ==========
+void ledInit() {
+  rgbLedWrite(STATUS_LED_PIN, 0, 0, 0);
+  ledState = LED_OFF;
+  ledLastToggleMs = 0;
+  ledBlinkOn = false;
+}
+void ledSetRGB(uint8_t r, uint8_t g, uint8_t b) {
+  rgbLedWrite(STATUS_LED_PIN, r, g, b);
+}
+void ledOff() { ledSetRGB(0, 0, 0); }
+
+void ledSetBootError() {
+  ledState = LED_BOOT_ERROR_RED_SOLID;
+  ledSetRGB(255, 0, 0);
+}
+void ledSetWifiConnecting() {
+  ledState = LED_WIFI_CONNECTING_BLUE_FAST;
+  ledLastToggleMs = 0;
+  ledBlinkOn = false;
+}
+void ledSetApMode() {
+  ledState = LED_AP_MODE_BLUE_SLOW;
+  ledLastToggleMs = 0;
+  ledBlinkOn = false;
+}
+void ledSetReadyConnected() {
+  ledState = LED_READY_GREEN_SOLID;
+  ledSetRGB(0, 255, 0);
+}
+void ledUpdate() {
+  unsigned long nowMs = millis();
+  switch (ledState) {
+    case LED_BOOT_ERROR_RED_SOLID:
+      // already solid red
+      break;
+
+    case LED_WIFI_CONNECTING_BLUE_FAST: {
+      const unsigned long interval = 120; // fast blink
+      if (nowMs - ledLastToggleMs >= interval) {
+        ledLastToggleMs = nowMs;
+        ledBlinkOn = !ledBlinkOn;
+        if (ledBlinkOn) ledSetRGB(0, 0, 255);
+        else ledOff();
+      }
+      break;
+    }
+
+    case LED_AP_MODE_BLUE_SLOW: {
+      const unsigned long interval = 700; // slow blink
+      if (nowMs - ledLastToggleMs >= interval) {
+        ledLastToggleMs = nowMs;
+        ledBlinkOn = !ledBlinkOn;
+        if (ledBlinkOn) ledSetRGB(0, 0, 180);
+        else ledOff();
+      }
+      break;
+    }
+
+    case LED_READY_GREEN_SOLID:
+      // already solid green
+      break;
+
+    default:
+      break;
+  }
+}
 
 // ========== UTILITY FUNCTIONS ==========
 String shortenName(String name) {
@@ -221,7 +315,6 @@ String htmlEscape(const String& s) {
   }
   return out;
 }
-
 int getSpotPrefix(String filename) {
   int underscorePos = filename.indexOf('_');
   if (underscorePos <= 0) return -1;
@@ -620,7 +713,6 @@ void saveScheduleEvents() {
   Serial.printf("[SCHEDULER] Saved %d events (%u bytes temp, %u bytes final)\n",
                 scheduleEventCount, (unsigned int)tempSize, (unsigned int)finalSize);
 }
-
 void playPlaylist(int playlistNum, bool resetIndex) {
   if (playlistNum < 1 || playlistNum > 10) return;
 
@@ -781,7 +873,6 @@ void processScheduleEvents() {
         playPlaylist(activePlaylistNum, true);
         lastActivePlaylistNum = activePlaylistNum;
       } else if (!audio.isRunning() && isMusicPlaying) {
-        // if song ended between scheduler ticks, force next
         if (!playNextTrackInCurrentPlaylist(true)) {
           playPlaylist(activePlaylistNum, true);
         }
@@ -855,7 +946,6 @@ void processScheduleEvents() {
     Serial.printf("[SCHEDULER] Spot event started: %s\n", getEventSummary(evt).c_str());
   }
 
-  // Handle scheduler-spot replay flow
   if (activeSpotIdx >= 0 && !audio.isRunning() && isSpotPlaying) {
     ScheduleEvent& evt = scheduleEvents[activeSpotIdx];
 
@@ -891,7 +981,6 @@ void processScheduleEvents() {
     }
   }
 
-  // Handle manually triggered spot finishing
   if (manualSpotInProgress && isSpotPlaying && !audio.isRunning()) {
     isSpotPlaying = false;
     manualSpotInProgress = false;
@@ -900,6 +989,7 @@ void processScheduleEvents() {
     resumeMusic();
   }
 }
+
 // ========== CONFIG MANAGEMENT ==========
 bool loadConfig() {
   File f = SD.open("/config/system.json");
@@ -979,14 +1069,12 @@ void audioTask(void* pvParameters) {
 
     bool nowRunning = audio.isRunning();
 
-    // reliable track-end progression
     if (wasRunning && !nowRunning) {
       if (!isSpotPlaying && !userPaused && !userStopped && !transportTransition && currentPlaylistNum > 0) {
         unsigned long nowMs = millis();
         if (nowMs - lastAutoNextMs > 200) {
           lastAutoNextMs = nowMs;
           if (!playNextTrackInCurrentPlaylist(true)) {
-            // fallback to scheduler decision
             tryResumeScheduledOrSilence();
           }
         }
@@ -1006,7 +1094,6 @@ void schedulerTask(void* pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
-
 // ========== MEDIA INDEXING ==========
 void indexTracks() {
   musicListCache = "";
@@ -1075,10 +1162,10 @@ void indexTracks() {
 String getHeader() {
   String h = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
   h += "<style>*{margin:0;padding:0;box-sizing:border-box;}body{font-family:sans-serif;background:#0b0e14;color:#cfd3d7;display:flex;min-height:100vh;}"
-       ".sidebar{width:70px;background:#161a23;display:flex;flex-direction:column;align-items:center;padding-top:12px;border-right:1px solid #282c34;flex-shrink:0;}"
-       ".sidebar>div{color:#007bff;font-size:16px;font-weight:bold;margin-bottom:15px;}"
-       ".sidebar a{color:#8b949e;text-decoration:none;font-size:11px;margin-bottom:14px;text-align:center;cursor:pointer;width:50px;}"
-       ".sidebar a:hover{color:#007bff;}"
+       ".sidebar{width:180px;background:#161a23;display:flex;flex-direction:column;align-items:stretch;padding:12px;border-right:1px solid #282c34;flex-shrink:0;}"
+       ".sidebar>div{color:#007bff;font-size:18px;font-weight:bold;margin-bottom:15px;text-align:center;}"
+       ".sidebar a{color:#8b949e;text-decoration:none;font-size:13px;margin-bottom:8px;padding:8px;border-radius:6px;cursor:pointer;}"
+       ".sidebar a:hover{color:#fff;background:#242b38;}"
        ".main{flex:1;padding:12px;overflow-y:auto;}"
        "h1{font-size:18px;margin-bottom:10px;}h2{font-size:14px;margin-bottom:8px;}"
        ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px;}"
@@ -1090,12 +1177,21 @@ String getHeader() {
        ".row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #2d333b;font-size:12px;}"
        ".row span{flex:1;}.row button{padding:4px 8px;font-size:10px;margin-left:4px;width:auto;}"
        ".btn-pause{background:#ff9800;}.btn-resume{background:#28a745;}.btn-stop{background:#d73a49;}"
-       "table{width:100%;border-collapse:collapse;font-size:11px;}th{background:#161a23;padding:5px 2px;text-align:center;}"
-       "td{border:1px solid #333;padding:2px;height:20px;vertical-align:top;font-size:8px;}"
-       ".evt-box{padding:1px;margin:0.5px;border-radius:2px;font-size:7px;color:white;cursor:pointer;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}"
-       ".evt-pl{background:#28a745;}.evt-vol{background:#ffc107;color:#000;}.evt-sp{background:#dc3545;}"
+
+       ".cal-wrap{overflow:auto;border:1px solid #303846;border-radius:8px;}"
+       ".cal-grid{display:grid;grid-template-columns:58px repeat(7, minmax(150px,1fr));min-width:1180px;background:#111722;}"
+       ".cal-head{position:sticky;top:0;z-index:20;background:#161d29;border-bottom:1px solid #303846;padding:8px 4px;text-align:center;font-size:12px;font-weight:bold;}"
+       ".time-col{position:relative;height:1440px;background:#0f141d;border-right:1px solid #303846;}"
+       ".time-mark{position:absolute;left:0;right:0;border-top:1px solid #263043;color:#7f8ba3;font-size:10px;padding-left:4px;line-height:1;}"
+       ".day-col{position:relative;height:1440px;border-right:1px solid #303846;background:repeating-linear-gradient(to bottom,#171f2d 0px,#171f2d 59px,#20293a 60px);}"
+       ".day-col:last-child{border-right:none;}"
+       ".event{position:absolute;border-radius:6px;padding:4px;font-size:10px;line-height:1.2;color:#fff;overflow:hidden;cursor:pointer;border:1px solid rgba(255,255,255,0.2);}"
+       ".event.pl{background:#28a745;}.event.vol{background:#ffc107;color:#111;}.event.sp{background:#dc3545;}"
+       ".event .t{font-weight:bold;display:block;white-space:nowrap;text-overflow:ellipsis;overflow:hidden;}"
+       ".event .s{display:block;white-space:nowrap;text-overflow:ellipsis;overflow:hidden;opacity:.95;}"
+
        ".modal{display:none;position:fixed;z-index:1000;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,0.7);}"
-       ".modal-box{background:#1c212c;margin:5% auto;padding:12px;border:1px solid #007bff;width:90%;max-width:380px;border-radius:6px;}"
+       ".modal-box{background:#1c212c;margin:5% auto;padding:12px;border:1px solid #007bff;width:90%;max-width:420px;border-radius:6px;}"
        ".close{color:#aaa;float:right;font-size:22px;cursor:pointer;}.close:hover{color:#fff;}"
        ".modal-btns{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;}.modal-btns button{flex:1;min-width:60px;}"
        ".checkbox-list{max-height:100px;overflow-y:auto;}.checkbox-list label{display:block;padding:3px;font-size:11px;}.checkbox-list input{margin-right:3px;}"
@@ -1104,7 +1200,7 @@ String getHeader() {
   h += "<script>"
        "const API_BASE = location.protocol + '//' + location.hostname + ':11000';"
        "function cmdPlay(url){fetch(API_BASE + url).then(r=>{if(r.ok)setTimeout(()=>location.reload(),100);});}"
-       "function cmdDel(path){if(confirm('Smazat?'))fetch(API_BASE + '/api/delete?p='+encodeURIComponent(path)).then(r=>{if(r.ok)setTimeout(()=>location.reload(),100);});}"
+       "function cmdDel(path){if(confirm('Delete?'))fetch(API_BASE + '/api/delete?p='+encodeURIComponent(path)).then(r=>{if(r.ok)setTimeout(()=>location.reload(),100);});}"
        "function cmdPause(){fetch(API_BASE + '/api/pause').then(r=>{if(r.ok)setTimeout(()=>location.reload(),100);});}"
        "function cmdResume(){fetch(API_BASE + '/api/resume').then(r=>{if(r.ok)setTimeout(()=>location.reload(),100);});}"
        "function cmdStop(){fetch(API_BASE + '/api/stop').then(r=>{if(r.ok)setTimeout(()=>location.reload(),100);});}"
@@ -1114,7 +1210,7 @@ String getHeader() {
        "function toggleAllDays(cb){document.querySelectorAll('.day-cb').forEach(function(b){b.checked=cb.checked;});}"
        "</script></head><body>";
 
-  h += "<div class='sidebar'><div>J</div><a href='/'>DASH</a><a href='/media'>MEDIA</a><a href='/playlists'>PL</a><a href='/scheduler'>SCHED</a><a href='/system'>SYST</a></div>";
+  h += "<div class='sidebar'><div>Jardio</div><a href='/'>Dashboard</a><a href='/media'>Media</a><a href='/playlists'>Playlists</a><a href='/scheduler'>Scheduler</a><a href='/system'>System</a></div>";
   return h;
 }
 
@@ -1130,8 +1226,8 @@ String getDashboard() {
   String h = getHeader();
   h += "<div class='main'><h1>Jardio SP1 <span style='font-size:12px;color:#8b949e;'>" + String(FIRMWARE_VERSION) + "</span></h1><div class='grid'>";
 
-  h += "<div class='tile'><h2>Čas & IP</h2><div style='font-size:16px;font-weight:bold;color:#fff;'>" + String(tS) + "</div>"
-                                                                                                                     "<div style='color:#8b949e;font-size:11px;margin-top:4px;'>"
+  h += "<div class='tile'><h2>Time & IP</h2><div style='font-size:16px;font-weight:bold;color:#fff;'>" + String(tS) + "</div>"
+       "<div style='color:#8b949e;font-size:11px;margin-top:4px;'>"
        + String(dS) + "<br>" + (apMode ? "AP: Jardio-SP1" : WiFi.localIP().toString()) + "</div></div>";
 
   String playbackText = "Silence";
@@ -1143,15 +1239,14 @@ String getDashboard() {
   h += "<div class='tile'><h2>Playback</h2>"
        "<div style='background:#282c34;padding:8px;border-radius:4px;font-size:13px;margin-bottom:6px;'>"
        + htmlEscape(playbackText) + "</div>"
-                                    "<div style='display:flex;gap:6px;'>"
-                                    "<button class='btn-pause' onclick='cmdPause()'>PAUSE</button>"
-                                    "<button class='btn-resume' onclick='cmdResume()'>RESUME</button>"
-                                    "<button class='btn-stop' onclick='cmdStop()'>STOP</button>"
-                                    "</div></div>";
+       "<div style='display:flex;gap:6px;'>"
+       "<button class='btn-pause' onclick='cmdPause()'>PAUSE</button>"
+       "<button class='btn-resume' onclick='cmdResume()'>RESUME</button>"
+       "<button class='btn-stop' onclick='cmdStop()'>STOP</button>"
+       "</div></div>";
 
-  h += "<div class='tile'><h2>Hlasitost</h2><div style='font-size:13px;color:#cfd3d7;'>Hudba: <strong>" + String(currentMusicVolume) + "</strong><br>Spoty: <strong>" + String(currentSpotVolume) + "</strong></div></div>";
-
-  h += "<div class='tile'><h2>SPOTy 1-10</h2>" + spotTriggersCache + "</div>";
+  h += "<div class='tile'><h2>Volume</h2><div style='font-size:13px;color:#cfd3d7;'>Music: <strong>" + String(currentMusicVolume) + "</strong><br>Spots: <strong>" + String(currentSpotVolume) + "</strong></div></div>";
+  h += "<div class='tile'><h2>Spot Triggers 1-10</h2>" + spotTriggersCache + "</div>";
 
   h += "</div></div></body></html>";
   return h;
@@ -1163,16 +1258,16 @@ String getMediaUI() {
   h += "<div class='tile'><h2>Music Upload</h2><form method='POST' action='/api/upload/music' enctype='multipart/form-data'><input type='file' name='u' multiple><button type='submit'>UPLOAD</button></form></div>";
   h += "<div class='tile'><h2>Spot Upload</h2><form method='POST' action='/api/upload/spot' enctype='multipart/form-data'><input type='file' name='u' multiple><button type='submit'>UPLOAD</button></form></div>";
   h += "<div class='tile'><h2>Music</h2>" + musicListCache + "</div>";
-  h += "<div class='tile'><h2>Spoty</h2>" + spotListCache + "</div>";
+  h += "<div class='tile'><h2>Spots</h2>" + spotListCache + "</div>";
   h += "</div></div></body></html>";
   return h;
 }
+
 String getPlaylistUI() {
   String h = getHeader();
-  h += "<div class='main'><h1>Playlisty</h1>";
+  h += "<div class='main'><h1>Playlists</h1>";
 
-  // playlist mode controls
-  h += "<div class='tile'><h2>Playlist režim</h2><form action='/api/playlistmode' method='POST'>";
+  h += "<div class='tile'><h2>Playlist Mode</h2><form action='/api/playlistmode' method='POST'>";
   for (int i = 1; i <= 10; i++) {
     h += "<div class='row'><span>PL" + String(i) + "</span><div style='display:flex;gap:6px;align-items:center;'>";
     h += "<label style='font-size:11px;white-space:nowrap;'><input type='checkbox' name='sh" + String(i) + "' " + String(playlistShuffle[i] ? "checked" : "") + "> Shuffle</label>";
@@ -1180,9 +1275,8 @@ String getPlaylistUI() {
     h += "<input style='width:70px;' type='number' min='0' max='999' name='st" + String(i) + "' value='" + String(playlistStartIndex[i]) + "'>";
     h += "</div></div>";
   }
-  h += "<button type='submit' style='width:100%;margin-top:8px;background:#17a2b8;'>ULOŽIT REŽIM</button></form></div>";
+  h += "<button type='submit' style='width:100%;margin-top:8px;background:#17a2b8;'>SAVE MODE</button></form></div>";
 
-  // playlist assignment
   h += "<div class='tile'><form action='/api/saveplaylists' method='POST'>";
   h += "<div style='display:flex;gap:4px;margin-bottom:8px;flex-wrap:wrap;'>";
   for (int i = 1; i <= 10; i++) {
@@ -1219,34 +1313,96 @@ String getPlaylistUI() {
 
 String getSchedulerUI() {
   String h = getHeader();
-  h += "<div class='main'><h1>Scheduler</h1><p style='color:#8b949e;font-size:10px;margin-bottom:6px;'>🟢 PL | 🟡 Vol | 🔴 Spot</p>";
+  h += "<div class='main'><h1>Scheduler</h1><p style='color:#8b949e;font-size:10px;margin-bottom:6px;'>🟢 Playlist | 🟡 Volume | 🔴 Spot</p>";
   h += "<button onclick=\"openModal('createModal')\" style='background:#28a745;padding:7px 10px;margin-bottom:6px;'>+ NEW</button>";
-  h += "<div style='overflow-x:auto;'><table><tr><th style='width:30px;'>H</th><th>Po</th><th>Út</th><th>St</th><th>Čt</th><th>Pá</th><th>So</th><th>Ne</th></tr>";
 
-  for (int hour = 0; hour <= 23; hour++) {
-    h += "<tr><td style='font-weight:bold;background:#161a23;'>" + String(hour) + "</td>";
-    for (int day = 0; day < 7; day++) {
-      h += "<td>";
-      for (int i = 0; i < scheduleEventCount; i++) {
-        ScheduleEvent& evt = scheduleEvents[i];
-        if (evt.day != day) continue;
-        int eventH = evt.startTime.substring(0, 2).toInt();
-        if (eventH != hour) continue;
-        String typeClass = (evt.type == "playlist") ? "evt-pl" : (evt.type == "volume") ? "evt-vol"
-                                                                                        : "evt-sp";
-        String typeShort = (evt.type == "playlist") ? "PL" + String(evt.target) : (evt.type == "volume") ? "V" + String(evt.volume)
-                                                                                                         : "S" + String(evt.target);
-        h += "<div class='evt-box " + typeClass + "' onclick=\"openModal('editModal_" + jsQuote(evt.id) + "')\" title='" + htmlEscape(getEventSummary(evt)) + "'>" + htmlEscape(typeShort) + "</div>";
-      }
-      h += "</td>";
-    }
-    h += "</tr>";
+  // GOOGLE-CALENDAR-LIKE VIEW
+  h += "<div class='cal-wrap'><div class='cal-grid'>";
+  h += "<div class='cal-head'>Time</div>";
+  String dayNames[] = { "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday" };
+  for (int d = 0; d < 7; d++) h += "<div class='cal-head'>" + dayNames[d] + "</div>";
+
+  h += "<div class='time-col'>";
+  for (int hh = 0; hh < 24; hh++) {
+    int top = hh * 60;
+    String label = (hh < 10 ? "0" : "") + String(hh) + ":00";
+    h += "<div class='time-mark' style='top:" + String(top) + "px;'>" + label + "</div>";
   }
-  h += "</table></div>";
+  h += "</div>";
 
+  for (int day = 0; day < 7; day++) {
+    h += "<div class='day-col'>";
+
+    int idx[100];
+    int c = 0;
+    for (int i = 0; i < scheduleEventCount; i++) if (scheduleEvents[i].day == day) idx[c++] = i;
+
+    int lane[100];
+    for (int i = 0; i < c; i++) lane[i] = 0;
+    int maxLane = 0;
+
+    for (int a = 0; a < c; a++) {
+      ScheduleEvent& A = scheduleEvents[idx[a]];
+      int aS = timeToMinutes(A.startTime);
+      int aE = (A.type == "spot") ? aS + 5 : timeToMinutes(A.endTime);
+      if (aS < 0) aS = 0;
+      if (aE < aS) aE = aS + 5;
+      if (A.type != "spot" && aE == aS) aE = aS + 1;
+
+      bool used[8] = { false,false,false,false,false,false,false,false };
+      for (int b = 0; b < a; b++) {
+        ScheduleEvent& B = scheduleEvents[idx[b]];
+        int bS = timeToMinutes(B.startTime);
+        int bE = (B.type == "spot") ? bS + 5 : timeToMinutes(B.endTime);
+        if (bS < 0) bS = 0;
+        if (bE < bS) bE = bS + 5;
+        bool overlap = (aS < bE && aE > bS);
+        if (overlap && lane[b] < 8) used[lane[b]] = true;
+      }
+
+      int L = 0;
+      while (L < 8 && used[L]) L++;
+      lane[a] = L;
+      if (L > maxLane) maxLane = L;
+    }
+
+    int lanesTotal = maxLane + 1;
+    if (lanesTotal < 1) lanesTotal = 1;
+
+    for (int a = 0; a < c; a++) {
+      ScheduleEvent& evt = scheduleEvents[idx[a]];
+      int start = timeToMinutes(evt.startTime);
+      if (start < 0) continue;
+      int end = (evt.type == "spot") ? start + 5 : timeToMinutes(evt.endTime);
+      if (end < start) end = start;
+      if (evt.type != "spot" && end == start) end = start + 1;
+
+      int top = start;
+      int height = max(18, end - start);
+
+      String cls = (evt.type == "playlist") ? "pl" : (evt.type == "volume") ? "vol" : "sp";
+      String title = (evt.type == "playlist") ? ("PL" + String(evt.target))
+                    : (evt.type == "volume") ? ("VOL " + String(evt.volume))
+                                             : ("SPOT " + String(evt.target));
+
+      float w = 100.0f / lanesTotal;
+      float l = lane[a] * w;
+
+      h += "<div class='event " + cls + "' onclick=\"openModal('editModal_" + jsQuote(evt.id) + "')\" title='" + htmlEscape(getEventSummary(evt)) + "' "
+           "style='top:" + String(top) + "px;height:" + String(height) + "px;left:calc(" + String(l, 3) + "% + 1px);width:calc(" + String(w, 3) + "% - 2px);'>";
+      h += "<span class='t'>" + htmlEscape(title) + "</span>";
+      h += "<span class='s'>" + htmlEscape(getEventTimeLabel(evt)) + "</span>";
+      h += "</div>";
+    }
+
+    h += "</div>";
+  }
+
+  h += "</div></div>";
+
+  // create/edit modals (EN)
   h += "<div id='createModal' class='modal'><div class='modal-box'><span class='close' onclick=\"closeModal('createModal')\">&times;</span><h2>New Event</h2><form id='createForm'>";
   h += "<label>Day:</label><select name='day' required>";
-  String dayNames[] = { "Pondělí", "Úterý", "Středa", "Čtvrtek", "Pátek", "Sobota", "Neděle" };
   for (int i = 0; i < 7; i++) h += "<option value='" + String(i) + "'>" + dayNames[i] + "</option>";
   h += "</select><label style='margin-top:6px;display:block;'>Start:</label><input type='time' name='startTime' required>";
   h += "<label style='margin-top:6px;display:block;'>Type:</label><select name='type' onchange='updateForm()' required>";
@@ -1273,6 +1429,7 @@ String getSchedulerUI() {
     }
     h += "</select><label style='margin-top:6px;display:block;'>Start:</label><input type='time' name='startTime' value='" + htmlEscape(evt.startTime) + "' required>";
     h += "<label style='margin-top:6px;display:block;'>Type:</label><select disabled><option>" + htmlEscape(evt.type) + "</option></select>";
+
     if (evt.type == "playlist") {
       h += "<label style='margin-top:6px;display:block;'>End:</label><input type='time' name='endTime' value='" + htmlEscape(evt.endTime) + "' required>";
       h += "<label style='margin-top:6px;display:block;'>Playlist:</label><select name='target'>";
@@ -1336,7 +1493,6 @@ String getSystemUI() {
 String getSetupUI() {
   return "<h1 style='text-align:center;margin-top:50px;'>Setup Mode<br>Connect to: Jardio-SP1 / admin123</h1>";
 }
-
 // ========== REQUEST HANDLERS ==========
 void handleSavePlaylistsFor(WebServer& ws) {
   for (int i = 1; i <= 10; i++) {
@@ -1557,10 +1713,16 @@ void setup() {
   delay(500);
   Serial.printf("\n\n[BOOT] Jardio OS %s starting...\n", FIRMWARE_VERSION);
 
+  ledInit();
+
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if (!SD.begin(SD_CS, sdSPI, 20000000)) {
     Serial.println("[ERROR] SD card init FAILED!");
-    while (1) delay(1000);
+    ledSetBootError(); // solid RED
+    while (1) {
+      ledUpdate();
+      delay(50);
+    }
   }
   Serial.println("[OK] SD card initialized");
 
@@ -1578,6 +1740,7 @@ void setup() {
   Serial.printf("[CONFIG] Loaded - Music Vol: %d, Spot Vol: %d\n", defaultMusicVolume, defaultSpotVolume);
 
   if (cfg.ssid.length() > 0) {
+    ledSetWifiConnecting(); // fast BLUE blink
     WiFi.mode(WIFI_STA);
     if (!cfg.dhcp) {
       IPAddress ip, gw, nm, d1;
@@ -1589,13 +1752,17 @@ void setup() {
     }
     WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
     unsigned long st = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - st < 8000) delay(500);
+    while (WiFi.status() != WL_CONNECTED && millis() - st < 8000) {
+      ledUpdate();
+      delay(100);
+    }
   }
 
   if (WiFi.status() != WL_CONNECTED) {
     apMode = true;
     WiFi.mode(WIFI_AP);
     WiFi.softAP("Jardio-SP1", "admin123");
+    ledSetApMode(); // slow BLUE blink
     Serial.println("[WIFI] AP Mode: Jardio-SP1 / admin123");
   } else {
     Serial.printf("[WIFI] Connected: %s - IP: %s\n", cfg.ssid.c_str(), WiFi.localIP().toString().c_str());
@@ -1603,6 +1770,7 @@ void setup() {
     configTime(0, 0, cfg.ntpServer.c_str());
     setenv("TZ", cfg.tz.c_str(), 1);
     tzset();
+    ledSetReadyConnected(); // solid GREEN
   }
 
   audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
@@ -1837,20 +2005,6 @@ void setup() {
     ESP.restart();
   });
 
-  // NOTE: upload handlers still use global server.upload() in your current code.
-  // Keep only if you rewrite handleFileUpload for apiServer.
-  // apiServer.on("/api/upload/music", HTTP_POST, []() {
-  //   indexTracks();
-  //   apiServer.sendHeader("Location", "/media");
-  //   apiServer.send(303);
-  // }, handleFileUpload);
-  //
-  // apiServer.on("/api/upload/spot", HTTP_POST, []() {
-  //   indexTracks();
-  //   apiServer.sendHeader("Location", "/media");
-  //   apiServer.send(303);
-  // }, handleFileUpload);
-
   apiServer.on("/api/delete", []() {
     if (apiServer.hasArg("p")) {
       SD.remove(urlDecode(apiServer.arg("p")));
@@ -1869,5 +2023,6 @@ void setup() {
 void loop() {
   server.handleClient();     // UI
   apiServer.handleClient();  // API
+  ledUpdate();               // keep LED blink states alive
   delay(1);
 }
