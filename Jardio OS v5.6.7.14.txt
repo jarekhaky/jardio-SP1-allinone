@@ -76,6 +76,7 @@ String urlEncode(String str);
 String urlDecode(String str);
 void initPlaylists();
 void initScheduler();
+void loadConfig();
 bool isInPlaylist(const String& filename, int playlistNum);
 void loadScheduleEvents();
 void saveScheduleEvents();
