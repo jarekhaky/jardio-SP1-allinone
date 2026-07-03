@@ -1,1 +1,1061 @@
-// placeholder
+/* Jardio OS v5.6.7.14 - playback state cleanup + connect guards + scheduler/spot hardening */
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+#include <FS.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <ArduinoJson.h>
+#include <Audio.h>
+#include "time.h"
+
+#define SD_CS 4
+#define SD_MOSI 5
+#define SD_SCK 6
+#define SD_MISO 7
+#define I2S_BCLK 17
+#define I2S_LRC 16
+#define I2S_DOUT 15
+
+const char* FIRMWARE_VERSION = "v5.6.7.14";
+
+// ========== EVENT STRUCTURE ==========
+struct ScheduleEvent {
+  String id;
+  int day;
+  String startTime;
+  String endTime;
+  String type;
+  int target;
+  int repeat;
+  int volume;
+  bool active;
+  int spotRepeatCount;
+  unsigned long pauseUntil;
+  long lastTriggerMinute;
+};
+
+// ========== PLAYBACK RUNTIME MODEL ==========
+enum PlaybackMode {
+  PB_IDLE = 0,
+  PB_MUSIC_SCHEDULED = 1,
+  PB_MUSIC_DIRECT = 2,
+  PB_SPOT_SCHEDULED = 3,
+  PB_SPOT_MANUAL = 4,
+  PB_PAUSED = 5,
+  PB_ERROR = 6
+};
+
+struct PlaybackRuntime {
+  PlaybackMode mode = PB_IDLE;
+  PlaybackMode modeBeforePause = PB_IDLE;
+  bool paused = false;
+  bool manualDirect = false;
+  bool spotScheduled = false;
+  bool spotManual = false;
+  bool error = false;
+};
+
+PlaybackRuntime pb;
+
+// ========== FORWARD DECLARATIONS ==========
+String getDashboard();
+String getMediaUI();
+String getPlaylistUI();
+String getSchedulerUI();
+String getSystemUI();
+String getSetupUI();
+String getHeader();
+void audioTask(void *pvParameters);
+void schedulerTask(void *pvParameters);
+void indexTracks();
+String generateEventId();
+String shortenName(String name);
+String urlEncode(String str);
+String urlDecode(String str);
+void initPlaylists();
+void initScheduler();
+bool isInPlaylist(const String& filename, int playlistNum);
+void loadScheduleEvents();
+void saveScheduleEvents();
+void processScheduleEvents();
+void playPlaylist(int playlistNum, bool resetIndex = false);
+void playTrackByName(String filename);
+bool playSpot(String filename, int volume, bool manualTrigger = false);
+void resumeMusic();
+void tryResumeScheduledOrSilence();
+int getSpotPrefix(String filename);
+String findSpotFile(int spotNum);
+String jsQuote(const String& s);
+String htmlEscape(const String& s);
+void resetEventRuntimeState(ScheduleEvent& evt);
+bool parseTimeString(const String& value, int& hour, int& minute);
+int timeToMinutes(const String& value);
+bool isValidTimeRangeForEvent(const ScheduleEvent& evt);
+bool isEventActiveNow(const ScheduleEvent& evt, int currentDay, int currentMinute);
+int findActivePlaylistForNow(int currentDay, int currentMinute);
+bool eventsEquivalentForDay(const ScheduleEvent& a, const ScheduleEvent& b, int targetDay);
+String getEventTimeLabel(const ScheduleEvent& evt);
+String getEventSummary(const ScheduleEvent& evt);
+
+int getPlaylistTrackCount(int playlistNum);
+String getPlaylistTrackAt(int playlistNum, int index);
+bool playTrackFromCurrentPlaylistIndex(int index);
+bool playNextTrackInCurrentPlaylist(bool wrapIfNeeded = true);
+bool startAudioFileWithGuard(const String& path, int volume, const char* tag);
+void setPlaylistModeFromArgs();
+void stopAllPlaybackRuntime(bool stopSong = true);
+void setPlaybackMode(PlaybackMode m);
+const char* playbackModeToString(PlaybackMode m);
+void updateLegacyFlagsFromRuntime();
+
+// ========== GLOBAL VARIABLES ==========
+Audio audio;
+WebServer server(80);
+File uploadFile;
+SPIClass sdSPI(HSPI);
+
+String musicListCache = "";
+String spotListCache = "";
+String spotTriggersCache = "";
+
+int defaultMusicVolume = 15;
+int defaultSpotVolume = 20;
+int currentMusicVolume = 15;
+int currentSpotVolume = 20;
+
+// legacy flags kept for UI/backward compatibility
+bool isSpotPlaying = false;
+bool isMusicPlaying = false;
+bool userPaused = false;
+bool manualDirectPlayback = false;
+
+int currentPlaylistNum = 0;
+
+String nowPlayingTrack = "";
+String lastPlayedFile = "";
+String currentPlaylistName = "";
+
+ScheduleEvent scheduleEvents[100];
+int scheduleEventCount = 0;
+int lastActivePlaylistNum = -1;
+
+bool apMode = false;
+TaskHandle_t schedulerTaskHandle = NULL;
+
+// Playback state internals
+bool manualSpotInProgress = false;
+bool waitingSpotReplay = false;   // scheduler spot internal replay phase
+unsigned long lastAutoNextMs = 0;
+String lastPlayedTrackName = "";
+
+// Playlist runtime mode
+bool playlistShuffle[11] = {false};       // 1..10
+int playlistStartIndex[11] = {0};         // 1..10
+int currentPlaylistTrackIndex = -1;
+int lastTrackIndexPerPlaylist[11];
+int rngSeedReady = 0;
+
+struct Config {
+  String ssid = ""; String pass = "";
+  bool dhcp = true;
+  String ip = "192.168.1.100"; String gw = "192.168.1.1";
+  String mask = "255.255.255.0"; String dns = "8.8.8.8";
+  String mdns = "jardio";
+  int musicVol = 15;
+  int spotVol = 20;
+  String ntpServer = "pool.ntp.org";
+  String tz = "CET-1CEST,M3.5.0,M10.5.0/3";
+} cfg;
+
+// ========== RUNTIME HELPERS ==========
+const char* playbackModeToString(PlaybackMode m) {
+  switch (m) {
+    case PB_IDLE: return "idle";
+    case PB_MUSIC_SCHEDULED: return "music-scheduled";
+    case PB_MUSIC_DIRECT: return "music-direct";
+    case PB_SPOT_SCHEDULED: return "spot-scheduled";
+    case PB_SPOT_MANUAL: return "spot-manual";
+    case PB_PAUSED: return "paused";
+    case PB_ERROR: return "error";
+    default: return "unknown";
+  }
+}
+
+void updateLegacyFlagsFromRuntime() {
+  userPaused = pb.paused;
+  manualDirectPlayback = pb.manualDirect;
+  isSpotPlaying = (pb.mode == PB_SPOT_MANUAL || pb.mode == PB_SPOT_SCHEDULED);
+  isMusicPlaying = (pb.mode == PB_MUSIC_DIRECT || pb.mode == PB_MUSIC_SCHEDULED || pb.mode == PB_PAUSED);
+}
+
+void setPlaybackMode(PlaybackMode m) {
+  pb.mode = m;
+  pb.error = (m == PB_ERROR);
+  pb.manualDirect = (m == PB_MUSIC_DIRECT);
+  pb.spotManual = (m == PB_SPOT_MANUAL);
+  pb.spotScheduled = (m == PB_SPOT_SCHEDULED);
+  updateLegacyFlagsFromRuntime();
+  Serial.printf("[STATE] mode=%s paused=%d direct=%d spotM=%d spotS=%d\n",
+                playbackModeToString(pb.mode), pb.paused, pb.manualDirect, pb.spotManual, pb.spotScheduled);
+}
+
+void stopAllPlaybackRuntime(bool stopSong) {
+  if (stopSong) audio.stopSong();
+  pb.paused = false;
+  pb.modeBeforePause = PB_IDLE;
+  manualSpotInProgress = false;
+  waitingSpotReplay = false;
+  setPlaybackMode(PB_IDLE);
+
+  currentPlaylistNum = 0;
+  currentPlaylistTrackIndex = -1;
+  nowPlayingTrack = "";
+  currentPlaylistName = "";
+}
+
+bool startAudioFileWithGuard(const String& path, int volume, const char* tag) {
+  audio.setVolume(constrain(volume, 0, 21));
+  bool ok = audio.connecttoFS(SD, path.c_str());
+  if (!ok) {
+    Serial.printf("[%s] connecttoFS FAILED: %s\n", tag, path.c_str());
+    setPlaybackMode(PB_ERROR);
+    return false;
+  }
+  Serial.printf("[%s] connecttoFS OK: %s (vol=%d)\n", tag, path.c_str(), volume);
+  return true;
+}
+
+// ========== UTILITY FUNCTIONS ==========
+String shortenName(String name) {
+  int dot = name.lastIndexOf('.');
+  if (dot > 0) name = name.substring(0, dot);
+  if (name.length() > 20) name = name.substring(0,20) + "...";
+  return name;
+}
+
+String urlEncode(String str) {
+  String encoded = "";
+  const char* hex = "0123456789ABCDEF";
+  for (unsigned int i = 0; i < str.length(); i++) {
+    unsigned char c = (unsigned char)str.charAt(i);
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += (char)c;
+    } else {
+      encoded += '%';
+      encoded += hex[(c >> 4) & 0x0F];
+      encoded += hex[c & 0x0F];
+    }
+  }
+  return encoded;
+}
+
+String urlDecode(String str) {
+  String decoded = "";
+  for (unsigned int i = 0; i < str.length(); i++) {
+    if (str.charAt(i) == '%') {
+      if (i + 2 < str.length()) {
+        char c = strtol(str.substring(i+1, i+3).c_str(), NULL, 16);
+        decoded += c;
+        i += 2;
+      }
+    } else if (str.charAt(i) == '+') decoded += ' ';
+    else decoded += str.charAt(i);
+  }
+  return decoded;
+}
+
+String jsQuote(const String& s) {
+  String out = "";
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if (c == '\\') out += "\\\\";
+    else if (c == '\"') out += "\\\"";
+    else if (c == '\'') out += "\\'";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else out += c;
+  }
+  return out;
+}
+
+String htmlEscape(const String& s) {
+  String out = "";
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if (c == '&') out += "&amp;";
+    else if (c == '<') out += "&lt;";
+    else if (c == '>') out += "&gt;";
+    else if (c == '\"') out += "&quot;";
+    else if (c == '\'') out += "&#39;";
+    else out += c;
+  }
+  return out;
+}
+
+int getSpotPrefix(String filename) {
+  int underscorePos = filename.indexOf('_');
+  if (underscorePos <= 0) return -1;
+  String prefix = filename.substring(0, underscorePos);
+  int num = prefix.toInt();
+  if (num >= 1 && num <= 10) return num;
+  return -1;
+}
+
+String findSpotFile(int spotNum) {
+  File root = SD.open("/spot");
+  if (!root) return "";
+  File f = root.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      String n = f.name();
+      if (n.startsWith("/")) n = n.substring(1);
+      int slash = n.lastIndexOf('/');
+      if (slash >= 0) n = n.substring(slash + 1);
+      if (getSpotPrefix(n) == spotNum) {
+        String result = n;
+        f.close();
+        root.close();
+        return result;
+      }
+    }
+    f = root.openNextFile();
+  }
+  root.close();
+  return "";
+}
+
+// ========== PLAYLIST FUNCTIONS ==========
+void initPlaylists() {
+  if (!SD.exists("/playlist")) SD.mkdir("/playlist");
+  for (int i = 1; i <= 10; i++) {
+    String path = "/playlist/pl" + String(i) + ".csv";
+    if (!SD.exists(path)) {
+      File f = SD.open(path, FILE_WRITE);
+      if (f) f.close();
+    }
+    lastTrackIndexPerPlaylist[i] = -1;
+  }
+}
+
+bool isInPlaylist(const String& filename, int playlistNum) {
+  String path = "/playlist/pl" + String(playlistNum) + ".csv";
+  File f = SD.open(path);
+  if (!f) return false;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line == filename) {
+      f.close();
+      return true;
+    }
+  }
+  f.close();
+  return false;
+}
+
+int getPlaylistTrackCount(int playlistNum) {
+  if (playlistNum < 1 || playlistNum > 10) return 0;
+  String path = "/playlist/pl" + String(playlistNum) + ".csv";
+  File f = SD.open(path);
+  if (!f) return 0;
+  int count = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) count++;
+  }
+  f.close();
+  return count;
+}
+
+String getPlaylistTrackAt(int playlistNum, int index) {
+  if (playlistNum < 1 || playlistNum > 10 || index < 0) return "";
+  String path = "/playlist/pl" + String(playlistNum) + ".csv";
+  File f = SD.open(path);
+  if (!f) return "";
+  int i = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    if (i == index) {
+      f.close();
+      return line;
+    }
+    i++;
+  }
+  f.close();
+  return "";
+}
+
+bool playTrackFromCurrentPlaylistIndex(int index) {
+  if (currentPlaylistNum < 1 || currentPlaylistNum > 10) return false;
+  String t = getPlaylistTrackAt(currentPlaylistNum, index);
+  if (t.length() == 0) {
+    Serial.printf("[PLAYLIST] Invalid track index %d in PL%d\n", index, currentPlaylistNum);
+    return false;
+  }
+
+  String path = "/music/" + t;
+  if (!SD.exists(path)) {
+    Serial.printf("[PLAYLIST] Missing file: %s\n", path.c_str());
+    return false;
+  }
+
+  currentPlaylistTrackIndex = index;
+  lastTrackIndexPerPlaylist[currentPlaylistNum] = index;
+  nowPlayingTrack = t;
+  lastPlayedTrackName = t;
+  lastPlayedFile = path;
+  currentPlaylistName = "PL" + String(currentPlaylistNum);
+  pb.paused = false;
+
+  if (!startAudioFileWithGuard(path, currentMusicVolume, "PLAYLIST")) {
+    return false;
+  }
+
+  setPlaybackMode(PB_MUSIC_SCHEDULED);
+  Serial.printf("[PLAYLIST] PL%d track #%d: %s\n", currentPlaylistNum, index + 1, t.c_str());
+  return true;
+}
+
+bool playNextTrackInCurrentPlaylist(bool wrapIfNeeded) {
+  if (currentPlaylistNum < 1 || currentPlaylistNum > 10) return false;
+  int total = getPlaylistTrackCount(currentPlaylistNum);
+  if (total <= 0) return false;
+
+  int nextIndex = -1;
+  bool sh = playlistShuffle[currentPlaylistNum];
+
+  if (sh) {
+    if (!rngSeedReady) {
+      randomSeed((uint32_t)esp_random());
+      rngSeedReady = 1;
+    }
+    if (total == 1) {
+      nextIndex = 0;
+    } else {
+      int guard = 0;
+      do {
+        nextIndex = random(0, total);
+        guard++;
+      } while (nextIndex == currentPlaylistTrackIndex && guard < 20);
+      if (nextIndex == currentPlaylistTrackIndex) nextIndex = (currentPlaylistTrackIndex + 1) % total;
+    }
+  } else {
+    if (currentPlaylistTrackIndex < 0) {
+      int start = playlistStartIndex[currentPlaylistNum];
+      if (start < 0) start = 0;
+      if (start >= total) start = 0;
+      nextIndex = start;
+    } else {
+      nextIndex = currentPlaylistTrackIndex + 1;
+      if (nextIndex >= total) {
+        if (!wrapIfNeeded) return false;
+        nextIndex = 0;
+      }
+    }
+  }
+
+  String candidate = getPlaylistTrackAt(currentPlaylistNum, nextIndex);
+  if (total > 1 && candidate == lastPlayedTrackName) {
+    int alt = (nextIndex + 1) % total;
+    String altName = getPlaylistTrackAt(currentPlaylistNum, alt);
+    if (altName.length() > 0 && altName != lastPlayedTrackName) nextIndex = alt;
+  }
+
+  // hard fallback loop: find first playable track
+  for (int tries = 0; tries < total; tries++) {
+    int idx = (nextIndex + tries) % total;
+    if (playTrackFromCurrentPlaylistIndex(idx)) return true;
+    if (!wrapIfNeeded && idx < nextIndex) break;
+  }
+
+  Serial.printf("[PLAYLIST] No playable tracks found in PL%d\n", currentPlaylistNum);
+  return false;
+}
+
+// ========== SCHEDULER FUNCTIONS ==========
+void initScheduler() {
+  if (!SD.exists("/scheduler")) SD.mkdir("/scheduler");
+}
+
+void resetEventRuntimeState(ScheduleEvent& evt) {
+  evt.active = false;
+  evt.spotRepeatCount = 0;
+  evt.pauseUntil = 0;
+  evt.lastTriggerMinute = -1;
+}
+
+bool parseTimeString(const String& value, int& hour, int& minute) {
+  if (value.length() != 5 || value.charAt(2) != ':') return false;
+  if (!isDigit(value.charAt(0)) || !isDigit(value.charAt(1)) || !isDigit(value.charAt(3)) || !isDigit(value.charAt(4))) return false;
+  hour = value.substring(0, 2).toInt();
+  minute = value.substring(3, 5).toInt();
+  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
+}
+
+int timeToMinutes(const String& value) {
+  int hour = 0, minute = 0;
+  if (!parseTimeString(value, hour, minute)) return -1;
+  return hour * 60 + minute;
+}
+
+bool isValidTimeRangeForEvent(const ScheduleEvent& evt) {
+  int start = timeToMinutes(evt.startTime);
+  if (start < 0) return false;
+  if (evt.type == "spot") return true;
+  int end = timeToMinutes(evt.endTime);
+  return end >= start;
+}
+
+bool isEventActiveNow(const ScheduleEvent& evt, int currentDay, int currentMinute) {
+  if (evt.day != currentDay) return false;
+  int start = timeToMinutes(evt.startTime);
+  if (start < 0) return false;
+  if (evt.type == "spot") return currentMinute == start;
+  int end = timeToMinutes(evt.endTime);
+  if (end < start) return false;
+  return currentMinute >= start && currentMinute <= end;
+}
+
+int findActivePlaylistForNow(int currentDay, int currentMinute) {
+  int playlistNum = -1;
+  for (int i = 0; i < scheduleEventCount; i++) {
+    const ScheduleEvent& evt = scheduleEvents[i];
+    if (evt.type != "playlist") continue;
+    if (isEventActiveNow(evt, currentDay, currentMinute)) playlistNum = evt.target;
+  }
+  return playlistNum;
+}
+
+bool eventsEquivalentForDay(const ScheduleEvent& a, const ScheduleEvent& b, int targetDay) {
+  if (a.type != b.type) return false;
+  if (b.day != targetDay) return false;
+  if (a.startTime != b.startTime) return false;
+  if (a.type == "playlist") return a.endTime == b.endTime && a.target == b.target;
+  if (a.type == "volume") return a.endTime == b.endTime && a.volume == b.volume;
+  if (a.type == "spot") return a.target == b.target && a.repeat == b.repeat && a.volume == b.volume;
+  return false;
+}
+
+String getEventTimeLabel(const ScheduleEvent& evt) {
+  if (evt.type == "spot") return evt.startTime;
+  return evt.startTime + "-" + evt.endTime;
+}
+
+String getEventSummary(const ScheduleEvent& evt) {
+  if (evt.type == "playlist") return getEventTimeLabel(evt) + " PL" + String(evt.target);
+  if (evt.type == "volume") return getEventTimeLabel(evt) + " VOL " + String(evt.volume);
+  return evt.startTime + " Spot " + String(evt.target) + " " + String(evt.repeat) + "x V" + String(evt.volume);
+}
+
+void loadScheduleEvents() {
+  scheduleEventCount = 0;
+  File f = SD.open("/scheduler/events.json");
+  if (!f) {
+    Serial.println("[SCHEDULER] No events file found");
+    return;
+  }
+
+  DynamicJsonDocument doc(32768);
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) {
+    Serial.printf("[SCHEDULER] Failed parse events.json: %s\n", err.c_str());
+    return;
+  }
+
+  JsonArray arr;
+  if (doc.is<JsonArray>()) arr = doc.as<JsonArray>();
+  else if (doc.is<JsonObject>() && doc["events"].is<JsonArray>()) arr = doc["events"].as<JsonArray>();
+  else {
+    Serial.println("[SCHEDULER] Unsupported events root");
+    return;
+  }
+
+  for (JsonVariant item : arr) {
+    if (scheduleEventCount >= 100) break;
+    if (!item.is<JsonObject>()) continue;
+
+    JsonObject obj = item.as<JsonObject>();
+    ScheduleEvent& evt = scheduleEvents[scheduleEventCount];
+    evt.id = obj["id"] | generateEventId();
+    evt.day = obj["day"] | 0;
+    evt.type = obj["type"].as<String>();
+    String legacyTime = obj["time"] | "";
+    evt.startTime = obj["startTime"] | legacyTime;
+    evt.endTime = obj["endTime"] | ((evt.type == "spot") ? "" : evt.startTime);
+    evt.target = obj["target"] | 1;
+    evt.repeat = constrain((int)(obj["repeat"] | 1), 1, 5);
+    evt.volume = constrain((int)(obj["volume"] | ((evt.type == "spot") ? defaultSpotVolume : defaultMusicVolume)), 0, 21);
+    resetEventRuntimeState(evt);
+
+    if (evt.day < 0 || evt.day > 6) continue;
+    if (evt.type != "playlist" && evt.type != "volume" && evt.type != "spot") continue;
+
+    if (evt.type == "spot" || evt.type == "playlist") evt.target = constrain(evt.target, 1, 10);
+    else evt.target = 0;
+
+    if (!isValidTimeRangeForEvent(evt)) continue;
+    scheduleEventCount++;
+  }
+  Serial.printf("[SCHEDULER] Loaded %d events\n", scheduleEventCount);
+}
+
+void saveScheduleEvents() {
+  const char* path = "/scheduler/events.json";
+  const char* tmpPath = "/scheduler/events.tmp";
+  SD.remove(tmpPath);
+
+  File f = SD.open(tmpPath, FILE_WRITE);
+  if (!f) return;
+
+  DynamicJsonDocument doc(32768);
+  doc["version"] = FIRMWARE_VERSION;
+  JsonArray arr = doc.createNestedArray("events");
+
+  for (int i = 0; i < scheduleEventCount; i++) {
+    JsonObject obj = arr.createNestedObject();
+    obj["id"] = scheduleEvents[i].id;
+    obj["day"] = scheduleEvents[i].day;
+    obj["startTime"] = scheduleEvents[i].startTime;
+    if (scheduleEvents[i].type != "spot") obj["endTime"] = scheduleEvents[i].endTime;
+    obj["time"] = scheduleEvents[i].startTime;
+    obj["type"] = scheduleEvents[i].type;
+    obj["target"] = scheduleEvents[i].target;
+    obj["repeat"] = scheduleEvents[i].repeat;
+    obj["volume"] = scheduleEvents[i].volume;
+  }
+
+  size_t written = serializeJson(doc, f);
+  f.flush();
+  f.close();
+  if (written == 0) { SD.remove(tmpPath); return; }
+
+  if (SD.exists(path)) SD.remove(path);
+  if (!SD.rename(tmpPath, path)) SD.remove(tmpPath);
+}
+
+void playPlaylist(int playlistNum, bool resetIndex) {
+  if (playlistNum < 1 || playlistNum > 10) return;
+
+  if (currentPlaylistNum != playlistNum) resetIndex = true;
+  currentPlaylistNum = playlistNum;
+  currentPlaylistName = "PL" + String(playlistNum);
+  pb.paused = false;
+
+  int total = getPlaylistTrackCount(playlistNum);
+  if (total <= 0) {
+    Serial.printf("[PLAYLIST] PL%d empty\n", playlistNum);
+    stopAllPlaybackRuntime(false);
+    return;
+  }
+
+  if (resetIndex) {
+    if (playlistShuffle[playlistNum]) currentPlaylistTrackIndex = -1;
+    else {
+      int start = playlistStartIndex[playlistNum];
+      if (start < 0 || start >= total) start = 0;
+      currentPlaylistTrackIndex = start - 1;
+    }
+  }
+
+  if (!playNextTrackInCurrentPlaylist(true)) {
+    Serial.printf("[PLAYLIST] Unable to start PL%d, fallback scheduler\n", playlistNum);
+    tryResumeScheduledOrSilence();
+  } else {
+    setPlaybackMode(PB_MUSIC_SCHEDULED);
+  }
+}
+
+void playTrackByName(String filename) {
+  filename.trim();
+  if (filename.length() == 0) return;
+
+  String path = "/music/" + filename;
+  if (!SD.exists(path)) {
+    Serial.printf("[PLAY] Direct file missing: %s\n", path.c_str());
+    return;
+  }
+
+  lastPlayedFile = path;
+  nowPlayingTrack = filename;
+  lastPlayedTrackName = filename;
+  currentPlaylistNum = 0;
+  currentPlaylistTrackIndex = -1;
+  currentPlaylistName = "DIRECT";
+  pb.paused = false;
+
+  if (!startAudioFileWithGuard(path, currentMusicVolume, "PLAY")) {
+    return;
+  }
+
+  setPlaybackMode(PB_MUSIC_DIRECT);
+  Serial.printf("[PLAY] Direct track: %s\n", filename.c_str());
+}
+
+bool playSpot(String filename, int volume, bool manualTrigger) {
+  filename.trim();
+  if (filename.length() == 0) return false;
+
+  String path = "/spot/" + filename;
+  if (!SD.exists(path)) {
+    Serial.printf("[SPOT] Missing file: %s\n", path.c_str());
+    return false;
+  }
+
+  nowPlayingTrack = filename;
+  currentSpotVolume = constrain(volume, 0, 21);
+  pb.paused = false;
+
+  if (!startAudioFileWithGuard(path, currentSpotVolume, "SPOT")) {
+    manualSpotInProgress = false;
+    waitingSpotReplay = false;
+    tryResumeScheduledOrSilence();
+    return false;
+  }
+
+  manualSpotInProgress = manualTrigger;
+  waitingSpotReplay = !manualTrigger;
+  setPlaybackMode(manualTrigger ? PB_SPOT_MANUAL : PB_SPOT_SCHEDULED);
+
+  Serial.printf("[SPOT] Playing %s vol=%d %s\n", filename.c_str(), currentSpotVolume, manualTrigger ? "[manual]" : "[scheduled]");
+  return true;
+}
+
+void tryResumeScheduledOrSilence() {
+  if (pb.paused) return;
+
+  time_t now;
+  struct tm ti;
+  time(&now);
+  localtime_r(&now, &ti);
+
+  int currentDay = (ti.tm_wday + 6) % 7;
+  int currentMinute = ti.tm_hour * 60 + ti.tm_min;
+  int scheduledPlaylist = findActivePlaylistForNow(currentDay, currentMinute);
+
+  if (scheduledPlaylist > 0) {
+    if (currentPlaylistNum != scheduledPlaylist) {
+      playPlaylist(scheduledPlaylist, true);
+    } else {
+      if (!audio.isRunning()) {
+        if (!playNextTrackInCurrentPlaylist(true)) playPlaylist(scheduledPlaylist, true);
+      }
+    }
+  } else {
+    stopAllPlaybackRuntime(true);
+    Serial.println("[AUDIO] No scheduled playlist -> silence");
+  }
+}
+
+void resumeMusic() {
+  manualSpotInProgress = false;
+  waitingSpotReplay = false;
+  tryResumeScheduledOrSilence();
+}
+
+void processScheduleEvents() {
+  if (pb.paused) return;
+
+  time_t nowTime;
+  struct tm ti;
+  time(&nowTime);
+  localtime_r(&nowTime, &ti);
+  int currentDay = (ti.tm_wday + 6) % 7;
+  int currentMinute = ti.tm_hour * 60 + ti.tm_min;
+  long currentEpochMinute = (long)(nowTime / 60);
+  unsigned long nowMs = millis();
+
+  int activePlaylistNum = findActivePlaylistForNow(currentDay, currentMinute);
+
+  for (int i = 0; i < scheduleEventCount; i++) {
+    ScheduleEvent& evt = scheduleEvents[i];
+    if (evt.type != "playlist") continue;
+    bool activeNow = isEventActiveNow(evt, currentDay, currentMinute);
+    if (activeNow && !evt.active) evt.active = true;
+    else if (!activeNow && evt.active) evt.active = false;
+  }
+
+  // scheduler controls music only when not in spot context
+  bool inSpotContext = (pb.mode == PB_SPOT_MANUAL || pb.mode == PB_SPOT_SCHEDULED);
+  if (!inSpotContext) {
+    if (activePlaylistNum > 0) {
+      if (currentPlaylistNum != activePlaylistNum) {
+        playPlaylist(activePlaylistNum, true);
+        lastActivePlaylistNum = activePlaylistNum;
+      } else if (!audio.isRunning() && (pb.mode == PB_MUSIC_SCHEDULED)) {
+        if (!playNextTrackInCurrentPlaylist(true)) tryResumeScheduledOrSilence();
+      }
+    } else {
+      if (pb.mode == PB_MUSIC_SCHEDULED && currentPlaylistNum > 0) {
+        stopAllPlaybackRuntime(true);
+        Serial.println("[SCHEDULER] No active playlist window -> silence");
+      }
+    }
+  }
+
+  int scheduledMusicVolume = defaultMusicVolume;
+  bool volumeActive = false;
+  for (int i = 0; i < scheduleEventCount; i++) {
+    ScheduleEvent& evt = scheduleEvents[i];
+    if (evt.type != "volume") continue;
+    bool activeNow = isEventActiveNow(evt, currentDay, currentMinute);
+    if (activeNow) {
+      scheduledMusicVolume = evt.volume;
+      volumeActive = true;
+    }
+    evt.active = activeNow;
+  }
+
+  if (currentMusicVolume != scheduledMusicVolume) {
+    currentMusicVolume = scheduledMusicVolume;
+    if (pb.mode == PB_MUSIC_SCHEDULED || pb.mode == PB_MUSIC_DIRECT) audio.setVolume(currentMusicVolume);
+    Serial.printf("[SCHEDULER] Music volume set %d%s\n", currentMusicVolume, volumeActive ? " (scheduled)" : " (default)");
+  }
+
+  int activeSpotIdx = -1;
+  for (int i = 0; i < scheduleEventCount; i++) {
+    if (scheduleEvents[i].type == "spot" && scheduleEvents[i].active) {
+      activeSpotIdx = i;
+      break;
+    }
+  }
+
+  for (int i = 0; i < scheduleEventCount; i++) {
+    ScheduleEvent& evt = scheduleEvents[i];
+    if (evt.type != "spot") continue;
+    if (evt.day != currentDay) continue;
+
+    int triggerMinute = timeToMinutes(evt.startTime);
+    if (triggerMinute < 0) continue;
+
+    if (evt.active) { activeSpotIdx = i; continue; }
+    if (activeSpotIdx >= 0 || inSpotContext) continue;
+    if (currentMinute != triggerMinute) continue;
+    if (evt.lastTriggerMinute == currentEpochMinute) continue;
+
+    evt.lastTriggerMinute = currentEpochMinute;
+    evt.pauseUntil = 0;
+    evt.spotRepeatCount = 0;
+
+    String spotFile = findSpotFile(evt.target);
+    if (spotFile.length() == 0) {
+      Serial.printf("[SCHEDULER] Spot file missing for Spot%d\n", evt.target);
+      continue;
+    }
+
+    evt.active = true;
+    if (playSpot(spotFile, evt.volume, false)) {
+      evt.spotRepeatCount = 1;
+      activeSpotIdx = i;
+    } else {
+      evt.active = false;
+      resumeMusic();
+    }
+  }
+
+  // Scheduled spot replay flow
+  if (activeSpotIdx >= 0 && pb.mode == PB_SPOT_SCHEDULED && !audio.isRunning()) {
+    ScheduleEvent& evt = scheduleEvents[activeSpotIdx];
+
+    if (evt.pauseUntil > 0) {
+      if (nowMs >= evt.pauseUntil) {
+        String spotFile = findSpotFile(evt.target);
+        if (spotFile.length() > 0 && playSpot(spotFile, evt.volume, false)) {
+          evt.pauseUntil = 0;
+          evt.spotRepeatCount++;
+          Serial.printf("[SCHEDULER] Spot replayed %d/%d\n", evt.spotRepeatCount, evt.repeat);
+        } else {
+          evt.active = false;
+          evt.pauseUntil = 0;
+          evt.spotRepeatCount = 0;
+          resumeMusic();
+        }
+      }
+    } else if (evt.spotRepeatCount < evt.repeat) {
+      evt.pauseUntil = nowMs + 2000;
+      waitingSpotReplay = true;
+      Serial.printf("[SCHEDULER] Spot pause 2s before %d/%d\n", evt.spotRepeatCount + 1, evt.repeat);
+    } else {
+      evt.active = false;
+      evt.pauseUntil = 0;
+      evt.spotRepeatCount = 0;
+      waitingSpotReplay = false;
+      resumeMusic();
+      Serial.println("[SCHEDULER] Spot finished all repeats");
+    }
+  }
+
+  // Manual spot finished -> back to scheduled logic
+  if (pb.mode == PB_SPOT_MANUAL && !audio.isRunning()) {
+    Serial.println("[SPOT] Manual spot finished -> resume scheduled/silence");
+    resumeMusic();
+  }
+}
+
+// ... (zbytek souboru ponechán stejný jako u tebe, kromě API bloků níže)
+
+// ========== REQUEST HANDLERS ==========
+// (beze změn: handleSavePlaylists, setPlaylistModeFromArgs, handleFileUpload, generateEventId, handleAdd/Edit/Delete/CopyEvent)
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.printf("\n\n[BOOT] Jardio OS %s starting...\n", FIRMWARE_VERSION);
+
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, sdSPI, 20000000)) {
+    Serial.println("[ERROR] SD card init FAILED!");
+    while (1) delay(1000);
+  }
+
+  initPlaylists();
+  initScheduler();
+
+  const char* dirs[] = {"/config", "/music", "/playlist", "/scheduler", "/spot"};
+  for (const char* d : dirs) if (!SD.exists(d)) SD.mkdir(d);
+
+  indexTracks();
+  loadConfig();
+  loadScheduleEvents();
+
+  if (cfg.ssid.length() > 0) {
+    WiFi.mode(WIFI_STA);
+    if (!cfg.dhcp) {
+      IPAddress ip, gw, nm, d1;
+      ip.fromString(cfg.ip); gw.fromString(cfg.gw); nm.fromString(cfg.mask); d1.fromString(cfg.dns);
+      WiFi.config(ip, gw, nm, d1);
+    }
+    WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
+    unsigned long st = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - st < 8000) delay(500);
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    apMode = true;
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("Jardio-SP1", "admin123");
+  } else {
+    MDNS.begin(cfg.mdns.c_str());
+    configTime(0, 0, cfg.ntpServer.c_str());
+    setenv("TZ", cfg.tz.c_str(), 1);
+    tzset();
+  }
+
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  audio.setVolume(currentMusicVolume);
+
+  setPlaybackMode(PB_IDLE);
+
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 20000, NULL, 6, NULL, 1);
+  xTaskCreatePinnedToCore(schedulerTask, "SchedulerTask", 5000, NULL, 4, &schedulerTaskHandle, 0);
+
+  server.on("/", []() { server.send(200, "text/html", apMode ? getSetupUI() : getDashboard()); });
+
+  // API consistency + guards
+  server.on("/api/play", []() {
+    if (!server.hasArg("f")) { server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing f\"}"); return; }
+    String fName = urlDecode(server.arg("f"));
+    playTrackByName(fName);
+    server.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/api/play-spot", []() {
+    if (!server.hasArg("f")) { server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing f\"}"); return; }
+    String fName = urlDecode(server.arg("f"));
+    int vol = server.hasArg("vol") ? constrain(server.arg("vol").toInt(), 0, 21) : defaultSpotVolume;
+    bool ok = playSpot(fName, vol, true);
+    if (!ok) { server.send(500, "application/json", "{\"ok\":false,\"err\":\"spot start failed\"}"); return; }
+    server.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/api/pause", []() {
+    if (pb.paused) { server.send(200, "application/json", "{\"ok\":true,\"state\":\"already-paused\"}"); return; }
+    if (!audio.isRunning()) { server.send(200, "application/json", "{\"ok\":true,\"state\":\"nothing-running\"}"); return; }
+
+    pb.modeBeforePause = pb.mode;
+    audio.pauseResume();
+    pb.paused = true;
+    setPlaybackMode(PB_PAUSED);
+    server.send(200, "application/json", "{\"ok\":true,\"state\":\"paused\"}");
+  });
+
+  server.on("/api/resume", []() {
+    if (pb.paused) {
+      audio.pauseResume();
+      pb.paused = false;
+      setPlaybackMode(pb.modeBeforePause == PB_IDLE ? PB_MUSIC_SCHEDULED : pb.modeBeforePause);
+      server.send(200, "application/json", "{\"ok\":true,\"state\":\"resumed\"}");
+      return;
+    }
+    if (!audio.isRunning()) {
+      tryResumeScheduledOrSilence();
+      server.send(200, "application/json", "{\"ok\":true,\"state\":\"scheduler-resume\"}");
+      return;
+    }
+    server.send(200, "application/json", "{\"ok\":true,\"state\":\"already-running\"}");
+  });
+
+  server.on("/api/stop", []() {
+    stopAllPlaybackRuntime(true);
+    server.send(200, "application/json", "{\"ok\":true,\"state\":\"stopped\"}");
+  });
+
+  server.on("/api/next", []() {
+    if (currentPlaylistNum <= 0) { server.send(400, "application/json", "{\"ok\":false,\"err\":\"no-active-playlist\"}"); return; }
+    bool ok = playNextTrackInCurrentPlaylist(true);
+    if (!ok) {
+      tryResumeScheduledOrSilence();
+      server.send(500, "application/json", "{\"ok\":false,\"err\":\"next-failed\"}");
+      return;
+    }
+    server.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  // ... ostatní route handlers nech stejné jako ve tvém souboru ...
+
+  server.begin();
+  Serial.printf("[BOOT] Jardio OS %s READY!\n", FIRMWARE_VERSION);
+}
+
+void audioTask(void *pvParameters) {
+  bool wasRunning = false;
+  for (;;) {
+    audio.loop();
+    bool nowRunning = audio.isRunning();
+
+    if (wasRunning && !nowRunning) {
+      if (pb.paused) {
+        // paused stream can appear as not running in some libs; ignore autoadvance
+      } else if (pb.mode == PB_MUSIC_SCHEDULED && currentPlaylistNum > 0) {
+        unsigned long nowMs = millis();
+        if (nowMs - lastAutoNextMs > 200) {
+          lastAutoNextMs = nowMs;
+          if (!playNextTrackInCurrentPlaylist(true)) tryResumeScheduledOrSilence();
+        }
+      } else if (pb.mode == PB_MUSIC_DIRECT) {
+        stopAllPlaybackRuntime(false);
+      }
+    }
+
+    wasRunning = nowRunning;
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+void schedulerTask(void *pvParameters) {
+  for (;;) {
+    processScheduleEvents();
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+void loop() {
+  server.handleClient();
+  delay(1);
+}
