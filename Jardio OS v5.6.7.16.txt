@@ -1,0 +1,1873 @@
+/* Jardio OS v5.6.7.16 - pause/resume deterministic (no random skip), stop-latch, spot resume, shuffle */
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+#include <FS.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <ArduinoJson.h>
+#include <Audio.h>
+#include "time.h"
+
+#define SD_CS 4
+#define SD_MOSI 5
+#define SD_SCK 6
+#define SD_MISO 7
+#define I2S_BCLK 17
+#define I2S_LRC 16
+#define I2S_DOUT 15
+
+const char* FIRMWARE_VERSION = "v5.6.7.16";
+
+// ========== EVENT STRUCTURE ==========
+struct ScheduleEvent {
+  String id;
+  int day;
+  String startTime;
+  String endTime;
+  String type;
+  int target;
+  int repeat;
+  int volume;
+  bool active;
+  int spotRepeatCount;
+  unsigned long pauseUntil;
+  long lastTriggerMinute;
+};
+
+// ========== FORWARD DECLARATIONS ==========
+String getDashboard();
+String getMediaUI();
+String getPlaylistUI();
+String getSchedulerUI();
+String getSystemUI();
+String getSetupUI();
+String getHeader();
+void audioTask(void* pvParameters);
+void schedulerTask(void* pvParameters);
+void indexTracks();
+String generateEventId();
+String shortenName(String name);
+String urlEncode(String str);
+String urlDecode(String str);
+void initPlaylists();
+void initScheduler();
+bool isInPlaylist(const String& filename, int playlistNum);
+void loadScheduleEvents();
+void saveScheduleEvents();
+void processScheduleEvents();
+void playPlaylist(int playlistNum, bool resetIndex = false);
+void playTrackByName(String filename);
+void playSpot(String filename, int volume, bool manualTrigger = false);
+void resumeMusic();
+void tryResumeScheduledOrSilence();
+int getSpotPrefix(String filename);
+String findSpotFile(int spotNum);
+String jsQuote(const String& s);
+String htmlEscape(const String& s);
+void resetEventRuntimeState(ScheduleEvent& evt);
+bool parseTimeString(const String& value, int& hour, int& minute);
+int timeToMinutes(const String& value);
+bool isValidTimeRangeForEvent(const ScheduleEvent& evt);
+bool isEventActiveNow(const ScheduleEvent& evt, int currentDay, int currentMinute);
+int findActivePlaylistForNow(int currentDay, int currentMinute);
+bool eventsEquivalentForDay(const ScheduleEvent& a, const ScheduleEvent& b, int targetDay);
+String getEventTimeLabel(const ScheduleEvent& evt);
+String getEventSummary(const ScheduleEvent& evt);
+
+int getPlaylistTrackCount(int playlistNum);
+String getPlaylistTrackAt(int playlistNum, int index);
+bool playTrackFromCurrentPlaylistIndex(int index);
+bool playNextTrackInCurrentPlaylist(bool wrapIfNeeded = true);
+void setPlaylistModeFromArgs();
+
+// ========== GLOBAL VARIABLES ==========
+Audio audio;
+WebServer server(80);        // UI only
+WebServer apiServer(11000);  // API only
+File uploadFile;
+SPIClass sdSPI(HSPI);
+
+String musicListCache = "";
+String spotListCache = "";
+String spotTriggersCache = "";
+
+int defaultMusicVolume = 15;
+int defaultSpotVolume = 20;
+int currentMusicVolume = 15;
+int currentSpotVolume = 20;
+
+bool isSpotPlaying = false;
+bool isMusicPlaying = false;
+int currentPlaylistNum = 0;
+
+String nowPlayingTrack = "";
+String lastPlayedFile = "";
+String currentPlaylistName = "";
+
+ScheduleEvent scheduleEvents[100];
+int scheduleEventCount = 0;
+int lastActivePlaylistNum = -1;
+
+bool apMode = false;
+TaskHandle_t schedulerTaskHandle = NULL;
+
+// Playback state
+bool userPaused = false;
+bool userStopped = false;          // hard stop latch
+bool transportTransition = false;  // blocks auto-next/scheduler during pause-resume ops
+bool manualDirectPlayback = false;
+bool manualSpotInProgress = false;
+bool waitingSpotReplay = false;  // scheduler spot internal replay phase
+unsigned long lastAutoNextMs = 0;
+String lastPlayedTrackName = "";
+
+// pause/resume deterministic cache
+bool pausedByUserWithTrack = false;
+String pausedTrackFile = "";
+int pausedPlaylistNum = 0;
+int pausedPlaylistIndex = -1;
+
+// Playlist runtime mode
+bool playlistShuffle[11] = { false };  // 1..10
+int playlistStartIndex[11] = { 0 };    // 1..10
+int currentPlaylistTrackIndex = -1;
+int lastTrackIndexPerPlaylist[11];
+int rngSeedReady = 0;
+
+struct Config {
+  String ssid = "";
+  String pass = "";
+  bool dhcp = true;
+  String ip = "192.168.1.100";
+  String gw = "192.168.1.1";
+  String mask = "255.255.255.0";
+  String dns = "8.8.8.8";
+  String mdns = "jardio";
+  int musicVol = 15;
+  int spotVol = 20;
+  String ntpServer = "pool.ntp.org";
+  String tz = "CET-1CEST,M3.5.0,M10.5.0/3";
+} cfg;
+
+// ========== UTILITY FUNCTIONS ==========
+String shortenName(String name) {
+  int dot = name.lastIndexOf('.');
+  if (dot > 0) name = name.substring(0, dot);
+  if (name.length() > 20) name = name.substring(0, 20) + "...";
+  return name;
+}
+
+String urlEncode(String str) {
+  String encoded = "";
+  const char* hex = "0123456789ABCDEF";
+  for (unsigned int i = 0; i < str.length(); i++) {
+    unsigned char c = (unsigned char)str.charAt(i);
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += (char)c;
+    } else {
+      encoded += '%';
+      encoded += hex[(c >> 4) & 0x0F];
+      encoded += hex[c & 0x0F];
+    }
+  }
+  return encoded;
+}
+
+String urlDecode(String str) {
+  String decoded = "";
+  for (unsigned int i = 0; i < str.length(); i++) {
+    if (str.charAt(i) == '%') {
+      if (i + 2 < str.length()) {
+        char c = strtol(str.substring(i + 1, i + 3).c_str(), NULL, 16);
+        decoded += c;
+        i += 2;
+      }
+    } else if (str.charAt(i) == '+') decoded += ' ';
+    else decoded += str.charAt(i);
+  }
+  return decoded;
+}
+String generateEventId() {
+  static unsigned long counter = 0;
+  return "evt_" + String(millis()) + "_" + String(counter++);
+}
+
+String jsQuote(const String& s) {
+  String out = "";
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if (c == '\\') out += "\\\\";
+    else if (c == '\"') out += "\\\"";
+    else if (c == '\'') out += "\\'";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else out += c;
+  }
+  return out;
+}
+
+String htmlEscape(const String& s) {
+  String out = "";
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if (c == '&') out += "&amp;";
+    else if (c == '<') out += "&lt;";
+    else if (c == '>') out += "&gt;";
+    else if (c == '\"') out += "&quot;";
+    else if (c == '\'') out += "&#39;";
+    else out += c;
+  }
+  return out;
+}
+
+int getSpotPrefix(String filename) {
+  int underscorePos = filename.indexOf('_');
+  if (underscorePos <= 0) return -1;
+  String prefix = filename.substring(0, underscorePos);
+  int num = prefix.toInt();
+  if (num >= 1 && num <= 10) return num;
+  return -1;
+}
+
+String findSpotFile(int spotNum) {
+  File root = SD.open("/spot");
+  if (!root) return "";
+  File f = root.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      String n = f.name();
+      if (n.startsWith("/")) n = n.substring(1);
+      int slash = n.lastIndexOf('/');
+      if (slash >= 0) n = n.substring(slash + 1);
+      if (getSpotPrefix(n) == spotNum) {
+        String result = n;
+        f.close();
+        root.close();
+        return result;
+      }
+    }
+    f = root.openNextFile();
+  }
+  root.close();
+  return "";
+}
+
+// ========== PLAYLIST FUNCTIONS ==========
+void initPlaylists() {
+  if (!SD.exists("/playlist")) SD.mkdir("/playlist");
+  for (int i = 1; i <= 10; i++) {
+    String path = "/playlist/pl" + String(i) + ".csv";
+    if (!SD.exists(path)) {
+      File f = SD.open(path, FILE_WRITE);
+      if (f) f.close();
+    }
+    lastTrackIndexPerPlaylist[i] = -1;
+  }
+}
+
+bool isInPlaylist(const String& filename, int playlistNum) {
+  String path = "/playlist/pl" + String(playlistNum) + ".csv";
+  File f = SD.open(path);
+  if (!f) return false;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line == filename) {
+      f.close();
+      return true;
+    }
+  }
+  f.close();
+  return false;
+}
+
+int getPlaylistTrackCount(int playlistNum) {
+  if (playlistNum < 1 || playlistNum > 10) return 0;
+  String path = "/playlist/pl" + String(playlistNum) + ".csv";
+  File f = SD.open(path);
+  if (!f) return 0;
+  int count = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) count++;
+  }
+  f.close();
+  return count;
+}
+
+String getPlaylistTrackAt(int playlistNum, int index) {
+  if (playlistNum < 1 || playlistNum > 10 || index < 0) return "";
+  String path = "/playlist/pl" + String(playlistNum) + ".csv";
+  File f = SD.open(path);
+  if (!f) return "";
+  int i = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    if (i == index) {
+      f.close();
+      return line;
+    }
+    i++;
+  }
+  f.close();
+  return "";
+}
+
+bool playTrackFromCurrentPlaylistIndex(int index) {
+  if (currentPlaylistNum < 1 || currentPlaylistNum > 10) return false;
+  String t = getPlaylistTrackAt(currentPlaylistNum, index);
+  if (t.length() == 0) return false;
+
+  currentPlaylistTrackIndex = index;
+  lastTrackIndexPerPlaylist[currentPlaylistNum] = index;
+  nowPlayingTrack = t;
+  lastPlayedTrackName = t;
+  lastPlayedFile = "/music/" + t;
+  currentPlaylistName = "PL" + String(currentPlaylistNum);
+  isMusicPlaying = true;
+  manualDirectPlayback = false;
+  userPaused = false;
+  userStopped = false;
+  audio.setVolume(currentMusicVolume);
+  audio.connecttoFS(SD, lastPlayedFile.c_str());
+
+  Serial.printf("[PLAYLIST] PL%d track #%d: %s (vol=%d)\n",
+                currentPlaylistNum, index + 1, t.c_str(), currentMusicVolume);
+  return true;
+}
+
+bool playNextTrackInCurrentPlaylist(bool wrapIfNeeded) {
+  if (currentPlaylistNum < 1 || currentPlaylistNum > 10) return false;
+  int total = getPlaylistTrackCount(currentPlaylistNum);
+  if (total <= 0) return false;
+
+  int nextIndex = -1;
+  bool sh = playlistShuffle[currentPlaylistNum];
+
+  if (sh) {
+    if (!rngSeedReady) {
+      randomSeed((uint32_t)esp_random());
+      rngSeedReady = 1;
+    }
+    if (total == 1) {
+      nextIndex = 0;
+    } else {
+      int guard = 0;
+      do {
+        nextIndex = random(0, total);
+        guard++;
+      } while (nextIndex == currentPlaylistTrackIndex && guard < 20);
+      if (nextIndex == currentPlaylistTrackIndex) {
+        nextIndex = (currentPlaylistTrackIndex + 1) % total;
+      }
+    }
+  } else {
+    if (currentPlaylistTrackIndex < 0) {
+      int start = playlistStartIndex[currentPlaylistNum];
+      if (start < 0) start = 0;
+      if (start >= total) start = 0;
+      nextIndex = start;
+    } else {
+      nextIndex = currentPlaylistTrackIndex + 1;
+      if (nextIndex >= total) {
+        if (!wrapIfNeeded) return false;
+        nextIndex = 0;
+      }
+    }
+  }
+
+  // anti-repeat by name (defensive, mainly for duplicates in csv)
+  String candidate = getPlaylistTrackAt(currentPlaylistNum, nextIndex);
+  if (total > 1 && candidate == lastPlayedTrackName) {
+    int alt = (nextIndex + 1) % total;
+    String altName = getPlaylistTrackAt(currentPlaylistNum, alt);
+    if (altName.length() > 0 && altName != lastPlayedTrackName) nextIndex = alt;
+  }
+
+  return playTrackFromCurrentPlaylistIndex(nextIndex);
+}
+
+// ========== SCHEDULER FUNCTIONS ==========
+void initScheduler() {
+  if (!SD.exists("/scheduler")) SD.mkdir("/scheduler");
+}
+
+void resetEventRuntimeState(ScheduleEvent& evt) {
+  evt.active = false;
+  evt.spotRepeatCount = 0;
+  evt.pauseUntil = 0;
+  evt.lastTriggerMinute = -1;
+}
+
+bool parseTimeString(const String& value, int& hour, int& minute) {
+  if (value.length() != 5 || value.charAt(2) != ':') return false;
+  if (!isDigit(value.charAt(0)) || !isDigit(value.charAt(1)) || !isDigit(value.charAt(3)) || !isDigit(value.charAt(4))) return false;
+  hour = value.substring(0, 2).toInt();
+  minute = value.substring(3, 5).toInt();
+  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
+}
+
+int timeToMinutes(const String& value) {
+  int hour = 0, minute = 0;
+  if (!parseTimeString(value, hour, minute)) return -1;
+  return hour * 60 + minute;
+}
+
+bool isValidTimeRangeForEvent(const ScheduleEvent& evt) {
+  int start = timeToMinutes(evt.startTime);
+  if (start < 0) return false;
+  if (evt.type == "spot") return true;
+  int end = timeToMinutes(evt.endTime);
+  return end >= start;
+}
+
+bool isEventActiveNow(const ScheduleEvent& evt, int currentDay, int currentMinute) {
+  if (evt.day != currentDay) return false;
+  int start = timeToMinutes(evt.startTime);
+  if (start < 0) return false;
+  if (evt.type == "spot") return currentMinute == start;
+  int end = timeToMinutes(evt.endTime);
+  if (end < start) return false;
+  return currentMinute >= start && currentMinute <= end;
+}
+
+int findActivePlaylistForNow(int currentDay, int currentMinute) {
+  int playlistNum = -1;
+  for (int i = 0; i < scheduleEventCount; i++) {
+    const ScheduleEvent& evt = scheduleEvents[i];
+    if (evt.type != "playlist") continue;
+    if (isEventActiveNow(evt, currentDay, currentMinute)) {
+      playlistNum = evt.target;
+    }
+  }
+  return playlistNum;
+}
+
+bool eventsEquivalentForDay(const ScheduleEvent& a, const ScheduleEvent& b, int targetDay) {
+  if (a.type != b.type) return false;
+  if (b.day != targetDay) return false;
+  if (a.startTime != b.startTime) return false;
+  if (a.type == "playlist") return a.endTime == b.endTime && a.target == b.target;
+  if (a.type == "volume") return a.endTime == b.endTime && a.volume == b.volume;
+  if (a.type == "spot") return a.target == b.target && a.repeat == b.repeat && a.volume == b.volume;
+  return false;
+}
+
+String getEventTimeLabel(const ScheduleEvent& evt) {
+  if (evt.type == "spot") return evt.startTime;
+  return evt.startTime + "-" + evt.endTime;
+}
+
+String getEventSummary(const ScheduleEvent& evt) {
+  if (evt.type == "playlist") return getEventTimeLabel(evt) + " PL" + String(evt.target);
+  if (evt.type == "volume") return getEventTimeLabel(evt) + " VOL " + String(evt.volume);
+  return evt.startTime + " Spot " + String(evt.target) + " " + String(evt.repeat) + "x V" + String(evt.volume);
+}
+void loadScheduleEvents() {
+  scheduleEventCount = 0;
+  File f = SD.open("/scheduler/events.json");
+  if (!f) {
+    Serial.println("[SCHEDULER] No events file found");
+    return;
+  }
+
+  size_t fileSize = f.size();
+  Serial.printf("[SCHEDULER] Loading /scheduler/events.json (%u bytes)\n", (unsigned int)fileSize);
+
+  DynamicJsonDocument doc(32768);
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+
+  if (err) {
+    Serial.printf("[SCHEDULER] Failed to parse events.json: %s\n", err.c_str());
+    return;
+  }
+
+  JsonArray arr;
+  if (doc.is<JsonArray>()) arr = doc.as<JsonArray>();
+  else if (doc.is<JsonObject>() && doc["events"].is<JsonArray>()) arr = doc["events"].as<JsonArray>();
+  else {
+    Serial.println("[SCHEDULER] Unsupported events root");
+    return;
+  }
+
+  int migratedCount = 0, skippedCount = 0, index = 0;
+  for (JsonVariant item : arr) {
+    if (scheduleEventCount >= 100) break;
+    if (!item.is<JsonObject>()) {
+      Serial.printf("[SCHEDULER] Skipping non-object event at index %d\n", index++);
+      skippedCount++;
+      continue;
+    }
+
+    JsonObject obj = item.as<JsonObject>();
+    ScheduleEvent& evt = scheduleEvents[scheduleEventCount];
+    evt.id = obj["id"] | generateEventId();
+    evt.day = obj["day"] | 0;
+    evt.type = obj["type"].as<String>();
+    String legacyTime = obj["time"] | "";
+    evt.startTime = obj["startTime"] | legacyTime;
+    evt.endTime = obj["endTime"] | ((evt.type == "spot") ? "" : evt.startTime);
+    evt.target = obj["target"] | 1;
+    evt.repeat = obj["repeat"] | 1;
+    evt.volume = obj["volume"] | ((evt.type == "spot") ? defaultSpotVolume : defaultMusicVolume);
+    evt.repeat = constrain(evt.repeat, 1, 5);
+    evt.volume = constrain(evt.volume, 0, 21);
+    resetEventRuntimeState(evt);
+
+    if (evt.day < 0 || evt.day > 6) {
+      skippedCount++;
+      index++;
+      continue;
+    }
+    if (evt.type != "playlist" && evt.type != "volume" && evt.type != "spot") {
+      skippedCount++;
+      index++;
+      continue;
+    }
+
+    if (legacyTime.length() > 0 && !obj.containsKey("startTime")) migratedCount++;
+    if (evt.type == "spot") {
+      evt.endTime = "";
+      if (evt.target < 1 || evt.target > 10) evt.target = 1;
+    } else if (evt.type == "playlist") {
+      if (evt.target < 1 || evt.target > 10) evt.target = 1;
+    } else {
+      evt.target = 0;
+    }
+
+    if (!isValidTimeRangeForEvent(evt)) {
+      skippedCount++;
+      index++;
+      continue;
+    }
+
+    scheduleEventCount++;
+    index++;
+  }
+  Serial.printf("[SCHEDULER] Loaded %d events (migrated=%d, skipped=%d)\n", scheduleEventCount, migratedCount, skippedCount);
+}
+
+void saveScheduleEvents() {
+  const char* path = "/scheduler/events.json";
+  const char* tmpPath = "/scheduler/events.tmp";
+  SD.remove(tmpPath);
+
+  File f = SD.open(tmpPath, FILE_WRITE);
+  if (!f) {
+    Serial.println("[SCHEDULER] Failed to open temp events file");
+    return;
+  }
+
+  DynamicJsonDocument doc(32768);
+  doc["version"] = FIRMWARE_VERSION;
+  JsonArray arr = doc.createNestedArray("events");
+
+  for (int i = 0; i < scheduleEventCount; i++) {
+    JsonObject obj = arr.createNestedObject();
+    obj["id"] = scheduleEvents[i].id;
+    obj["day"] = scheduleEvents[i].day;
+    obj["startTime"] = scheduleEvents[i].startTime;
+    if (scheduleEvents[i].type != "spot") obj["endTime"] = scheduleEvents[i].endTime;
+    obj["time"] = scheduleEvents[i].startTime;  // legacy
+    obj["type"] = scheduleEvents[i].type;
+    obj["target"] = scheduleEvents[i].target;
+    obj["repeat"] = scheduleEvents[i].repeat;
+    obj["volume"] = scheduleEvents[i].volume;
+  }
+
+  size_t written = serializeJson(doc, f);
+  f.flush();
+  size_t tempSize = f.size();
+  f.close();
+
+  if (written == 0) {
+    Serial.println("[SCHEDULER] Failed to serialize events");
+    SD.remove(tmpPath);
+    return;
+  }
+
+  if (SD.exists(path)) SD.remove(path);
+  bool renamed = SD.rename(tmpPath, path);
+  if (!renamed) {
+    File src = SD.open(tmpPath, FILE_READ);
+    File dst = SD.open(path, FILE_WRITE);
+    if (!src || !dst) {
+      if (src) src.close();
+      if (dst) dst.close();
+      SD.remove(tmpPath);
+      return;
+    }
+    uint8_t buffer[256];
+    while (src.available()) {
+      int len = src.read(buffer, sizeof(buffer));
+      if (len > 0) dst.write(buffer, len);
+    }
+    dst.flush();
+    src.close();
+    dst.close();
+    SD.remove(tmpPath);
+  }
+
+  File verify = SD.open(path, FILE_READ);
+  size_t finalSize = verify ? verify.size() : 0;
+  if (verify) verify.close();
+  Serial.printf("[SCHEDULER] Saved %d events (%u bytes temp, %u bytes final)\n",
+                scheduleEventCount, (unsigned int)tempSize, (unsigned int)finalSize);
+}
+
+void playPlaylist(int playlistNum, bool resetIndex) {
+  if (playlistNum < 1 || playlistNum > 10) return;
+
+  if (currentPlaylistNum != playlistNum) resetIndex = true;
+  currentPlaylistNum = playlistNum;
+  currentPlaylistName = "PL" + String(playlistNum);
+  isMusicPlaying = true;
+  manualDirectPlayback = false;
+  userPaused = false;
+  userStopped = false;
+
+  int total = getPlaylistTrackCount(playlistNum);
+  if (total <= 0) {
+    Serial.printf("[PLAYLIST] PL%d empty\n", playlistNum);
+    isMusicPlaying = false;
+    nowPlayingTrack = "";
+    currentPlaylistTrackIndex = -1;
+    return;
+  }
+
+  if (resetIndex) {
+    if (playlistShuffle[playlistNum]) currentPlaylistTrackIndex = -1;
+    else {
+      int start = playlistStartIndex[playlistNum];
+      if (start < 0 || start >= total) start = 0;
+      currentPlaylistTrackIndex = start - 1;  // so next call starts at start
+    }
+  }
+
+  if (!playNextTrackInCurrentPlaylist(true)) {
+    Serial.printf("[PLAYLIST] Unable to start PL%d\n", playlistNum);
+    isMusicPlaying = false;
+  } else {
+    Serial.printf("[PLAYLIST] Started PL%d: %s\n", playlistNum, nowPlayingTrack.c_str());
+  }
+}
+
+void playTrackByName(String filename) {
+  filename.trim();
+  if (filename.length() == 0) return;
+
+  lastPlayedFile = "/music/" + filename;
+  nowPlayingTrack = filename;
+  lastPlayedTrackName = filename;
+  currentPlaylistNum = 0;
+  currentPlaylistTrackIndex = -1;
+  currentPlaylistName = "DIRECT";
+  isMusicPlaying = true;
+  isSpotPlaying = false;
+  manualDirectPlayback = true;
+  userPaused = false;
+  userStopped = false;
+  audio.setVolume(currentMusicVolume);
+  audio.connecttoFS(SD, lastPlayedFile.c_str());
+  Serial.printf("[PLAY] Direct track: %s (vol=%d)\n", filename.c_str(), currentMusicVolume);
+}
+
+void playSpot(String filename, int volume, bool manualTrigger) {
+  Serial.printf("[AUDIO] Playing spot: %s (vol=%d)%s\n", filename.c_str(), volume, manualTrigger ? " [manual]" : "");
+  isSpotPlaying = true;
+  manualSpotInProgress = manualTrigger;
+  waitingSpotReplay = !manualTrigger;
+  currentSpotVolume = volume;
+  userPaused = false;
+  audio.setVolume(currentSpotVolume);
+  audio.connecttoFS(SD, ("/spot/" + filename).c_str());
+}
+
+void tryResumeScheduledOrSilence() {
+  if (userStopped) {
+    audio.stopSong();
+    isMusicPlaying = false;
+    currentPlaylistNum = 0;
+    currentPlaylistTrackIndex = -1;
+    nowPlayingTrack = "";
+    currentPlaylistName = "";
+    return;
+  }
+
+  time_t now;
+  struct tm ti;
+  time(&now);
+  localtime_r(&now, &ti);
+  int currentDay = (ti.tm_wday + 6) % 7;
+  int currentMinute = ti.tm_hour * 60 + ti.tm_min;
+  int scheduledPlaylist = findActivePlaylistForNow(currentDay, currentMinute);
+
+  if (scheduledPlaylist > 0) {
+    if (currentPlaylistNum != scheduledPlaylist) {
+      playPlaylist(scheduledPlaylist, true);
+    } else {
+      if (!audio.isRunning()) {
+        if (!playNextTrackInCurrentPlaylist(true)) {
+          playPlaylist(scheduledPlaylist, true);
+        }
+      }
+    }
+  } else {
+    audio.stopSong();
+    isMusicPlaying = false;
+    currentPlaylistNum = 0;
+    currentPlaylistTrackIndex = -1;
+    nowPlayingTrack = "";
+    currentPlaylistName = "";
+    Serial.println("[AUDIO] No scheduled playlist -> silence");
+  }
+}
+
+void resumeMusic() {
+  isSpotPlaying = false;
+  manualSpotInProgress = false;
+  waitingSpotReplay = false;
+
+  if (userStopped) {
+    audio.stopSong();
+    isMusicPlaying = false;
+    currentPlaylistNum = 0;
+    currentPlaylistTrackIndex = -1;
+    nowPlayingTrack = "";
+    currentPlaylistName = "";
+    Serial.println("[AUDIO] Resume blocked by user STOP -> silence");
+    return;
+  }
+
+  tryResumeScheduledOrSilence();
+}
+
+void processScheduleEvents() {
+  time_t nowTime;
+  struct tm ti;
+  time(&nowTime);
+  localtime_r(&nowTime, &ti);
+  int currentDay = (ti.tm_wday + 6) % 7;
+  int currentMinute = ti.tm_hour * 60 + ti.tm_min;
+  long currentEpochMinute = (long)(nowTime / 60);
+  unsigned long nowMs = millis();
+
+  int activePlaylistNum = -1;
+
+  for (int i = 0; i < scheduleEventCount; i++) {
+    ScheduleEvent& evt = scheduleEvents[i];
+    if (evt.type != "playlist") continue;
+    bool activeNow = isEventActiveNow(evt, currentDay, currentMinute);
+    if (activeNow) activePlaylistNum = evt.target;
+
+    if (activeNow && !evt.active) {
+      evt.active = true;
+      Serial.printf("[SCHEDULER] Playlist active: %s\n", getEventSummary(evt).c_str());
+    } else if (!activeNow && evt.active) {
+      evt.active = false;
+      Serial.printf("[SCHEDULER] Playlist ended: %s\n", getEventSummary(evt).c_str());
+    }
+  }
+
+  if (!isSpotPlaying && !userPaused && !userStopped && !transportTransition) {
+    if (activePlaylistNum > 0) {
+      if (currentPlaylistNum != activePlaylistNum) {
+        playPlaylist(activePlaylistNum, true);
+        lastActivePlaylistNum = activePlaylistNum;
+      } else if (!audio.isRunning() && isMusicPlaying) {
+        // if song ended between scheduler ticks, force next
+        if (!playNextTrackInCurrentPlaylist(true)) {
+          playPlaylist(activePlaylistNum, true);
+        }
+      }
+    } else if (currentPlaylistNum > 0) {
+      audio.stopSong();
+      isMusicPlaying = false;
+      currentPlaylistNum = 0;
+      currentPlaylistTrackIndex = -1;
+      nowPlayingTrack = "";
+      Serial.println("[SCHEDULER] No active playlist - silence");
+    }
+  }
+
+  int scheduledMusicVolume = defaultMusicVolume;
+  bool volumeActive = false;
+  for (int i = 0; i < scheduleEventCount; i++) {
+    ScheduleEvent& evt = scheduleEvents[i];
+    if (evt.type != "volume") continue;
+    bool activeNow = isEventActiveNow(evt, currentDay, currentMinute);
+    if (activeNow) {
+      scheduledMusicVolume = evt.volume;
+      volumeActive = true;
+    }
+    if (activeNow && !evt.active) evt.active = true;
+    else if (!activeNow && evt.active) evt.active = false;
+  }
+
+  if (currentMusicVolume != scheduledMusicVolume) {
+    currentMusicVolume = scheduledMusicVolume;
+    if (!isSpotPlaying && isMusicPlaying) audio.setVolume(currentMusicVolume);
+    Serial.printf("[SCHEDULER] Music volume set to %d%s\n", currentMusicVolume, volumeActive ? " (scheduled)" : " (default)");
+  }
+
+  int activeSpotIdx = -1;
+  for (int i = 0; i < scheduleEventCount; i++) {
+    if (scheduleEvents[i].type == "spot" && scheduleEvents[i].active) {
+      activeSpotIdx = i;
+      break;
+    }
+  }
+
+  for (int i = 0; i < scheduleEventCount; i++) {
+    ScheduleEvent& evt = scheduleEvents[i];
+    if (evt.type != "spot") continue;
+    if (evt.day != currentDay) continue;
+    int triggerMinute = timeToMinutes(evt.startTime);
+    if (triggerMinute < 0) continue;
+    if (evt.active) {
+      activeSpotIdx = i;
+      continue;
+    }
+    if (activeSpotIdx >= 0 || isSpotPlaying) continue;
+    if (currentMinute != triggerMinute) continue;
+    if (evt.lastTriggerMinute == currentEpochMinute) continue;
+
+    evt.lastTriggerMinute = currentEpochMinute;
+    evt.pauseUntil = 0;
+    evt.spotRepeatCount = 0;
+
+    String spotFile = findSpotFile(evt.target);
+    if (spotFile.length() == 0) {
+      Serial.printf("[SCHEDULER] Spot file missing for Spot%d\n", evt.target);
+      continue;
+    }
+
+    evt.active = true;
+    playSpot(spotFile, evt.volume, false);
+    evt.spotRepeatCount = 1;
+    activeSpotIdx = i;
+    Serial.printf("[SCHEDULER] Spot event started: %s\n", getEventSummary(evt).c_str());
+  }
+
+  // Handle scheduler-spot replay flow
+  if (activeSpotIdx >= 0 && !audio.isRunning() && isSpotPlaying) {
+    ScheduleEvent& evt = scheduleEvents[activeSpotIdx];
+
+    if (evt.pauseUntil > 0) {
+      if (nowMs >= evt.pauseUntil) {
+        String spotFile = findSpotFile(evt.target);
+        if (spotFile.length() > 0) {
+          evt.pauseUntil = 0;
+          playSpot(spotFile, evt.volume, false);
+          evt.spotRepeatCount++;
+          Serial.printf("[SCHEDULER] Spot replayed: %d/%d\n", evt.spotRepeatCount, evt.repeat);
+        } else {
+          evt.active = false;
+          evt.pauseUntil = 0;
+          evt.spotRepeatCount = 0;
+          isSpotPlaying = false;
+          waitingSpotReplay = false;
+          resumeMusic();
+        }
+      }
+    } else if (evt.spotRepeatCount < evt.repeat) {
+      evt.pauseUntil = nowMs + 2000;
+      waitingSpotReplay = true;
+      Serial.printf("[SCHEDULER] Spot pause 2sec, replay %d/%d\n", evt.spotRepeatCount + 1, evt.repeat);
+    } else {
+      evt.active = false;
+      evt.pauseUntil = 0;
+      evt.spotRepeatCount = 0;
+      isSpotPlaying = false;
+      waitingSpotReplay = false;
+      resumeMusic();
+      Serial.println("[SCHEDULER] Spot finished all replays");
+    }
+  }
+
+  // Handle manually triggered spot finishing
+  if (manualSpotInProgress && isSpotPlaying && !audio.isRunning()) {
+    isSpotPlaying = false;
+    manualSpotInProgress = false;
+    waitingSpotReplay = false;
+    Serial.println("[AUDIO] Manual spot finished -> resume scheduled playback");
+    resumeMusic();
+  }
+}
+// ========== CONFIG MANAGEMENT ==========
+bool loadConfig() {
+  File f = SD.open("/config/system.json");
+  if (!f) return false;
+  StaticJsonDocument<4096> doc;
+  if (deserializeJson(doc, f)) {
+    f.close();
+    return false;
+  }
+
+  cfg.ssid = doc["wifi"]["ssid"] | "";
+  cfg.pass = doc["wifi"]["pass"] | "";
+  cfg.dhcp = doc["net"]["dhcp"] | true;
+  cfg.ip = doc["net"]["ip"] | "192.168.1.100";
+  cfg.gw = doc["net"]["gw"] | "192.168.1.1";
+  cfg.mask = doc["net"]["mask"] | "255.255.255.0";
+  cfg.dns = doc["net"]["dns"] | "8.8.8.8";
+  cfg.mdns = doc["mdns"] | "jardio";
+  cfg.musicVol = doc["volume"]["music"] | 15;
+  cfg.spotVol = doc["volume"]["spot"] | 20;
+  cfg.ntpServer = doc["time"]["ntp"] | "pool.ntp.org";
+  cfg.tz = doc["time"]["tz"] | "CET-1CEST,M3.5.0,M10.5.0/3";
+
+  defaultMusicVolume = cfg.musicVol;
+  defaultSpotVolume = cfg.spotVol;
+  currentMusicVolume = cfg.musicVol;
+  currentSpotVolume = cfg.spotVol;
+
+  JsonObject pmode = doc["playlistMode"];
+  for (int i = 1; i <= 10; i++) {
+    String kSh = "pl" + String(i) + "_shuffle";
+    String kSt = "pl" + String(i) + "_start";
+    playlistShuffle[i] = pmode[kSh] | false;
+    playlistStartIndex[i] = pmode[kSt] | 0;
+    if (playlistStartIndex[i] < 0) playlistStartIndex[i] = 0;
+  }
+
+  f.close();
+  return true;
+}
+
+void saveConfig() {
+  SD.remove("/config/system.json");
+  File f = SD.open("/config/system.json", FILE_WRITE);
+  if (!f) return;
+
+  StaticJsonDocument<4096> doc;
+  doc["wifi"]["ssid"] = cfg.ssid;
+  doc["wifi"]["pass"] = cfg.pass;
+  doc["net"]["dhcp"] = cfg.dhcp;
+  doc["net"]["ip"] = cfg.ip;
+  doc["net"]["gw"] = cfg.gw;
+  doc["net"]["mask"] = cfg.mask;
+  doc["net"]["dns"] = cfg.dns;
+  doc["mdns"] = cfg.mdns;
+  doc["volume"]["music"] = cfg.musicVol;
+  doc["volume"]["spot"] = cfg.spotVol;
+  doc["time"]["ntp"] = cfg.ntpServer;
+  doc["time"]["tz"] = cfg.tz;
+
+  JsonObject pmode = doc.createNestedObject("playlistMode");
+  for (int i = 1; i <= 10; i++) {
+    pmode["pl" + String(i) + "_shuffle"] = playlistShuffle[i];
+    pmode["pl" + String(i) + "_start"] = playlistStartIndex[i];
+  }
+
+  serializeJson(doc, f);
+  f.close();
+}
+
+// ========== AUDIO TASKS ==========
+void audioTask(void* pvParameters) {
+  bool wasRunning = false;
+
+  for (;;) {
+    audio.loop();
+
+    bool nowRunning = audio.isRunning();
+
+    // reliable track-end progression
+    if (wasRunning && !nowRunning) {
+      if (!isSpotPlaying && !userPaused && !userStopped && !transportTransition && currentPlaylistNum > 0) {
+        unsigned long nowMs = millis();
+        if (nowMs - lastAutoNextMs > 200) {
+          lastAutoNextMs = nowMs;
+          if (!playNextTrackInCurrentPlaylist(true)) {
+            // fallback to scheduler decision
+            tryResumeScheduledOrSilence();
+          }
+        }
+      } else if (!isSpotPlaying && manualDirectPlayback) {
+        isMusicPlaying = false;
+      }
+    }
+
+    wasRunning = nowRunning;
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+void schedulerTask(void* pvParameters) {
+  for (;;) {
+    processScheduleEvents();
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// ========== MEDIA INDEXING ==========
+void indexTracks() {
+  musicListCache = "";
+  spotListCache = "";
+  spotTriggersCache = "";
+
+  File rootMusic = SD.open("/music");
+  if (rootMusic) {
+    File f = rootMusic.openNextFile();
+    while (f) {
+      if (!f.isDirectory()) {
+        String n = f.name();
+        if (n.startsWith("/")) n = n.substring(1);
+        int slash = n.lastIndexOf('/');
+        if (slash >= 0) n = n.substring(slash + 1);
+        String shortN = shortenName(n);
+        String enc = urlEncode(n);
+        musicListCache += "<div class='row'><span>" + htmlEscape(shortN) + "</span>"
+                                                                           "<button onclick=\"cmdPlay('/api/play?f="
+                          + enc + "')\">PLAY</button>"
+                                  "<button class='btn-del' onclick=\"cmdDel('/music/"
+                          + enc + "')\">DEL</button></div>";
+      }
+      f = rootMusic.openNextFile();
+    }
+    rootMusic.close();
+  }
+
+  File rootSpot = SD.open("/spot");
+  if (rootSpot) {
+    File f = rootSpot.openNextFile();
+    while (f) {
+      if (!f.isDirectory()) {
+        String n = f.name();
+        if (n.startsWith("/")) n = n.substring(1);
+        int slash = n.lastIndexOf('/');
+        if (slash >= 0) n = n.substring(slash + 1);
+        String shortN = shortenName(n);
+        String enc = urlEncode(n);
+        spotListCache += "<div class='row'><span>" + htmlEscape(shortN) + "</span>"
+                                                                          "<button onclick=\"cmdPlay('/api/play-spot?f="
+                         + enc + "&vol=" + String(defaultSpotVolume) + "')\">PLAY</button>"
+                                                                       "<button class='btn-del' onclick=\"cmdDel('/spot/"
+                         + enc + "')\">DEL</button></div>";
+      }
+      f = rootSpot.openNextFile();
+    }
+    rootSpot.close();
+  }
+
+  spotTriggersCache = "";
+  for (int i = 1; i <= 10; i++) {
+    String spotFile = findSpotFile(i);
+    String buttonText = spotFile.length() > 0 ? shortenName(spotFile) : String(i);
+
+    String disabled = spotFile.length() > 0 ? "" : " disabled style='opacity:0.4;'";
+    String onclick = spotFile.length() > 0
+                       ? "onclick=\"cmdPlay('/api/play-spot?f=" + String(i) + "&vol=" + String(defaultSpotVolume) + "')\""
+                       : "";
+
+    spotTriggersCache += "<button class='spot-btn' " + onclick + disabled + ">" + htmlEscape(buttonText) + "</button>";
+  }
+}
+
+// ========== HTML UI FUNCTIONS ==========
+String getHeader() {
+  String h = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  h += "<style>*{margin:0;padding:0;box-sizing:border-box;}body{font-family:sans-serif;background:#0b0e14;color:#cfd3d7;display:flex;min-height:100vh;}"
+       ".sidebar{width:70px;background:#161a23;display:flex;flex-direction:column;align-items:center;padding-top:12px;border-right:1px solid #282c34;flex-shrink:0;}"
+       ".sidebar>div{color:#007bff;font-size:16px;font-weight:bold;margin-bottom:15px;}"
+       ".sidebar a{color:#8b949e;text-decoration:none;font-size:11px;margin-bottom:14px;text-align:center;cursor:pointer;width:50px;}"
+       ".sidebar a:hover{color:#007bff;}"
+       ".main{flex:1;padding:12px;overflow-y:auto;}"
+       "h1{font-size:18px;margin-bottom:10px;}h2{font-size:14px;margin-bottom:8px;}"
+       ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px;}"
+       ".tile{background:#1c212c;border-radius:6px;padding:10px;border:1px solid #282c34;}"
+       "input,select,button{padding:7px;border-radius:4px;border:none;background:#282c34;color:#fff;font-size:13px;margin:4px 0;}"
+       "input,select{width:100%;}button{background:#007bff;cursor:pointer;font-weight:bold;}"
+       ".btn-del{background:#d73a49;padding:5px 10px;font-size:11px;margin-left:4px;}"
+       ".spot-btn{background:#f39c12;padding:6px 4px;font-size:10px;margin:2px;width:calc(20% - 4px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
+       ".row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #2d333b;font-size:12px;}"
+       ".row span{flex:1;}.row button{padding:4px 8px;font-size:10px;margin-left:4px;width:auto;}"
+       ".btn-pause{background:#ff9800;}.btn-resume{background:#28a745;}.btn-stop{background:#d73a49;}"
+       "table{width:100%;border-collapse:collapse;font-size:11px;}th{background:#161a23;padding:5px 2px;text-align:center;}"
+       "td{border:1px solid #333;padding:2px;height:20px;vertical-align:top;font-size:8px;}"
+       ".evt-box{padding:1px;margin:0.5px;border-radius:2px;font-size:7px;color:white;cursor:pointer;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}"
+       ".evt-pl{background:#28a745;}.evt-vol{background:#ffc107;color:#000;}.evt-sp{background:#dc3545;}"
+       ".modal{display:none;position:fixed;z-index:1000;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,0.7);}"
+       ".modal-box{background:#1c212c;margin:5% auto;padding:12px;border:1px solid #007bff;width:90%;max-width:380px;border-radius:6px;}"
+       ".close{color:#aaa;float:right;font-size:22px;cursor:pointer;}.close:hover{color:#fff;}"
+       ".modal-btns{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;}.modal-btns button{flex:1;min-width:60px;}"
+       ".checkbox-list{max-height:100px;overflow-y:auto;}.checkbox-list label{display:block;padding:3px;font-size:11px;}.checkbox-list input{margin-right:3px;}"
+       "</style>";
+
+  h += "<script>"
+       "const API_BASE = location.protocol + '//' + location.hostname + ':11000';"
+       "function cmdPlay(url){fetch(API_BASE + url).then(r=>{if(r.ok)setTimeout(()=>location.reload(),100);});}"
+       "function cmdDel(path){if(confirm('Smazat?'))fetch(API_BASE + '/api/delete?p='+encodeURIComponent(path)).then(r=>{if(r.ok)setTimeout(()=>location.reload(),100);});}"
+       "function cmdPause(){fetch(API_BASE + '/api/pause').then(r=>{if(r.ok)setTimeout(()=>location.reload(),100);});}"
+       "function cmdResume(){fetch(API_BASE + '/api/resume').then(r=>{if(r.ok)setTimeout(()=>location.reload(),100);});}"
+       "function cmdStop(){fetch(API_BASE + '/api/stop').then(r=>{if(r.ok)setTimeout(()=>location.reload(),100);});}"
+       "function openModal(id){var el=document.getElementById(id);if(el)el.style.display='block';}"
+       "function closeModal(id){var el=document.getElementById(id);if(el)el.style.display='none';}"
+       "window.onclick=function(e){if(e.target.classList&&e.target.classList.contains('modal'))e.target.style.display='none';};"
+       "function toggleAllDays(cb){document.querySelectorAll('.day-cb').forEach(function(b){b.checked=cb.checked;});}"
+       "</script></head><body>";
+
+  h += "<div class='sidebar'><div>J</div><a href='/'>DASH</a><a href='/media'>MEDIA</a><a href='/playlists'>PL</a><a href='/scheduler'>SCHED</a><a href='/system'>SYST</a></div>";
+  return h;
+}
+
+String getDashboard() {
+  time_t now;
+  struct tm ti;
+  time(&now);
+  localtime_r(&now, &ti);
+  char tS[9] = { 0 }, dS[11] = { 0 };
+  strftime(tS, sizeof(tS), "%H:%M:%S", &ti);
+  strftime(dS, sizeof(dS), "%d.%m.%Y", &ti);
+
+  String h = getHeader();
+  h += "<div class='main'><h1>Jardio SP1 <span style='font-size:12px;color:#8b949e;'>" + String(FIRMWARE_VERSION) + "</span></h1><div class='grid'>";
+
+  h += "<div class='tile'><h2>Čas & IP</h2><div style='font-size:16px;font-weight:bold;color:#fff;'>" + String(tS) + "</div>"
+                                                                                                                     "<div style='color:#8b949e;font-size:11px;margin-top:4px;'>"
+       + String(dS) + "<br>" + (apMode ? "AP: Jardio-SP1" : WiFi.localIP().toString()) + "</div></div>";
+
+  String playbackText = "Silence";
+  if (isSpotPlaying) playbackText = "SPOT: " + nowPlayingTrack;
+  else if (isMusicPlaying) playbackText = nowPlayingTrack.length() ? nowPlayingTrack : "...";
+  if (userPaused) playbackText = "[PAUSED] " + playbackText;
+  if (userStopped) playbackText = "[STOPPED] Silence";
+
+  h += "<div class='tile'><h2>Playback</h2>"
+       "<div style='background:#282c34;padding:8px;border-radius:4px;font-size:13px;margin-bottom:6px;'>"
+       + htmlEscape(playbackText) + "</div>"
+                                    "<div style='display:flex;gap:6px;'>"
+                                    "<button class='btn-pause' onclick='cmdPause()'>PAUSE</button>"
+                                    "<button class='btn-resume' onclick='cmdResume()'>RESUME</button>"
+                                    "<button class='btn-stop' onclick='cmdStop()'>STOP</button>"
+                                    "</div></div>";
+
+  h += "<div class='tile'><h2>Hlasitost</h2><div style='font-size:13px;color:#cfd3d7;'>Hudba: <strong>" + String(currentMusicVolume) + "</strong><br>Spoty: <strong>" + String(currentSpotVolume) + "</strong></div></div>";
+
+  h += "<div class='tile'><h2>SPOTy 1-10</h2>" + spotTriggersCache + "</div>";
+
+  h += "</div></div></body></html>";
+  return h;
+}
+
+String getMediaUI() {
+  String h = getHeader();
+  h += "<div class='main'><h1>Media</h1><div class='grid'>";
+  h += "<div class='tile'><h2>Music Upload</h2><form method='POST' action='/api/upload/music' enctype='multipart/form-data'><input type='file' name='u' multiple><button type='submit'>UPLOAD</button></form></div>";
+  h += "<div class='tile'><h2>Spot Upload</h2><form method='POST' action='/api/upload/spot' enctype='multipart/form-data'><input type='file' name='u' multiple><button type='submit'>UPLOAD</button></form></div>";
+  h += "<div class='tile'><h2>Music</h2>" + musicListCache + "</div>";
+  h += "<div class='tile'><h2>Spoty</h2>" + spotListCache + "</div>";
+  h += "</div></div></body></html>";
+  return h;
+}
+String getPlaylistUI() {
+  String h = getHeader();
+  h += "<div class='main'><h1>Playlisty</h1>";
+
+  // playlist mode controls
+  h += "<div class='tile'><h2>Playlist režim</h2><form action='/api/playlistmode' method='POST'>";
+  for (int i = 1; i <= 10; i++) {
+    h += "<div class='row'><span>PL" + String(i) + "</span><div style='display:flex;gap:6px;align-items:center;'>";
+    h += "<label style='font-size:11px;white-space:nowrap;'><input type='checkbox' name='sh" + String(i) + "' " + String(playlistShuffle[i] ? "checked" : "") + "> Shuffle</label>";
+    h += "<label style='font-size:11px;white-space:nowrap;'>Start idx:</label>";
+    h += "<input style='width:70px;' type='number' min='0' max='999' name='st" + String(i) + "' value='" + String(playlistStartIndex[i]) + "'>";
+    h += "</div></div>";
+  }
+  h += "<button type='submit' style='width:100%;margin-top:8px;background:#17a2b8;'>ULOŽIT REŽIM</button></form></div>";
+
+  // playlist assignment
+  h += "<div class='tile'><form action='/api/saveplaylists' method='POST'>";
+  h += "<div style='display:flex;gap:4px;margin-bottom:8px;flex-wrap:wrap;'>";
+  for (int i = 1; i <= 10; i++) {
+    h += "<label style='font-size:11px;'><input type='checkbox' onchange='document.querySelectorAll(\"input[name=\\\"pl" + String(i) + "\\\"]\").forEach(cb=>cb.checked=this.checked)'> " + String(i) + "</label>";
+  }
+  h += "</div>";
+
+  File root = SD.open("/music");
+  if (root) {
+    File f = root.openNextFile();
+    while (f) {
+      if (!f.isDirectory()) {
+        String n = f.name();
+        if (n.startsWith("/")) n = n.substring(1);
+        int slash = n.lastIndexOf('/');
+        if (slash >= 0) n = n.substring(slash + 1);
+        String shortN = shortenName(n);
+        String enc = urlEncode(n);
+        h += "<div class='row'><span>" + htmlEscape(shortN) + "</span><div style='display:flex;gap:3px;'>";
+        for (int i = 1; i <= 10; i++) {
+          bool checked = isInPlaylist(n, i);
+          h += "<label style='font-size:10px;'><input type='checkbox' name='pl" + String(i) + "' value='" + enc + "' " + (checked ? "checked" : "") + ">" + String(i) + "</label>";
+        }
+        h += "</div></div>";
+      }
+      f = root.openNextFile();
+    }
+    root.close();
+  }
+  h += "<button type='submit' style='width:100%;margin-top:8px;background:#28a745;'>SAVE</button></form></div>";
+  h += "</div></body></html>";
+  return h;
+}
+
+String getSchedulerUI() {
+  String h = getHeader();
+  h += "<div class='main'><h1>Scheduler</h1><p style='color:#8b949e;font-size:10px;margin-bottom:6px;'>🟢 PL | 🟡 Vol | 🔴 Spot</p>";
+  h += "<button onclick=\"openModal('createModal')\" style='background:#28a745;padding:7px 10px;margin-bottom:6px;'>+ NEW</button>";
+  h += "<div style='overflow-x:auto;'><table><tr><th style='width:30px;'>H</th><th>Po</th><th>Út</th><th>St</th><th>Čt</th><th>Pá</th><th>So</th><th>Ne</th></tr>";
+
+  for (int hour = 0; hour <= 23; hour++) {
+    h += "<tr><td style='font-weight:bold;background:#161a23;'>" + String(hour) + "</td>";
+    for (int day = 0; day < 7; day++) {
+      h += "<td>";
+      for (int i = 0; i < scheduleEventCount; i++) {
+        ScheduleEvent& evt = scheduleEvents[i];
+        if (evt.day != day) continue;
+        int eventH = evt.startTime.substring(0, 2).toInt();
+        if (eventH != hour) continue;
+        String typeClass = (evt.type == "playlist") ? "evt-pl" : (evt.type == "volume") ? "evt-vol"
+                                                                                        : "evt-sp";
+        String typeShort = (evt.type == "playlist") ? "PL" + String(evt.target) : (evt.type == "volume") ? "V" + String(evt.volume)
+                                                                                                         : "S" + String(evt.target);
+        h += "<div class='evt-box " + typeClass + "' onclick=\"openModal('editModal_" + jsQuote(evt.id) + "')\" title='" + htmlEscape(getEventSummary(evt)) + "'>" + htmlEscape(typeShort) + "</div>";
+      }
+      h += "</td>";
+    }
+    h += "</tr>";
+  }
+  h += "</table></div>";
+
+  h += "<div id='createModal' class='modal'><div class='modal-box'><span class='close' onclick=\"closeModal('createModal')\">&times;</span><h2>New Event</h2><form id='createForm'>";
+  h += "<label>Day:</label><select name='day' required>";
+  String dayNames[] = { "Pondělí", "Úterý", "Středa", "Čtvrtek", "Pátek", "Sobota", "Neděle" };
+  for (int i = 0; i < 7; i++) h += "<option value='" + String(i) + "'>" + dayNames[i] + "</option>";
+  h += "</select><label style='margin-top:6px;display:block;'>Start:</label><input type='time' name='startTime' required>";
+  h += "<label style='margin-top:6px;display:block;'>Type:</label><select name='type' onchange='updateForm()' required>";
+  h += "<option value='playlist'>Playlist</option><option value='volume'>Volume</option><option value='spot'>Spot</option></select>";
+  h += "<div id='endTimeRow'><label style='margin-top:6px;display:block;'>End:</label><input type='time' name='endTime' required></div>";
+  h += "<div id='playlistFields'><label style='margin-top:6px;display:block;'>Playlist:</label><select name='playlistTarget'>";
+  for (int i = 1; i <= 10; i++) h += "<option value='" + String(i) + "'>PL " + String(i) + "</option>";
+  h += "</select></div>";
+  h += "<div id='volumeFields' style='display:none;'><label style='margin-top:6px;display:block;'>Volume:</label><input type='number' name='volumeValue' min='0' max='21' value='15'></div>";
+  h += "<div id='spotFields' style='display:none;'><label style='margin-top:6px;display:block;'>Spot:</label><select name='spotTarget'>";
+  for (int i = 1; i <= 10; i++) h += "<option value='" + String(i) + "'>Spot " + String(i) + "</option>";
+  h += "</select><label style='margin-top:6px;display:block;'>Repeat:</label><select name='repeat'>";
+  for (int i = 1; i <= 5; i++) h += "<option value='" + String(i) + "'>" + String(i) + "x</option>";
+  h += "</select><label style='margin-top:6px;display:block;'>Volume:</label><input type='number' name='spotVolume' min='0' max='21' value='20'></div>";
+  h += "<div class='modal-btns'><button type='button' onclick='saveNewEvent()' style='background:#28a745;'>SAVE</button><button type='button' onclick=\"closeModal('createModal')\" style='background:#6c757d;'>CLOSE</button></div></form></div></div>";
+
+  for (int i = 0; i < scheduleEventCount; i++) {
+    ScheduleEvent& evt = scheduleEvents[i];
+    h += "<div id='editModal_" + htmlEscape(evt.id) + "' class='modal'><div class='modal-box'><span class='close' onclick=\"closeModal('editModal_" + jsQuote(evt.id) + "')\">&times;</span><h2>Edit Event</h2><form id='editForm_" + htmlEscape(evt.id) + "'>";
+    h += "<label>Day:</label><select name='day' required>";
+    for (int d = 0; d < 7; d++) {
+      String sel = (d == evt.day) ? "selected" : "";
+      h += "<option value='" + String(d) + "' " + sel + ">" + dayNames[d] + "</option>";
+    }
+    h += "</select><label style='margin-top:6px;display:block;'>Start:</label><input type='time' name='startTime' value='" + htmlEscape(evt.startTime) + "' required>";
+    h += "<label style='margin-top:6px;display:block;'>Type:</label><select disabled><option>" + htmlEscape(evt.type) + "</option></select>";
+    if (evt.type == "playlist") {
+      h += "<label style='margin-top:6px;display:block;'>End:</label><input type='time' name='endTime' value='" + htmlEscape(evt.endTime) + "' required>";
+      h += "<label style='margin-top:6px;display:block;'>Playlist:</label><select name='target'>";
+      for (int t = 1; t <= 10; t++) h += "<option value='" + String(t) + "' " + (t == evt.target ? "selected" : "") + ">PL " + String(t) + "</option>";
+      h += "</select>";
+    } else if (evt.type == "volume") {
+      h += "<label style='margin-top:6px;display:block;'>End:</label><input type='time' name='endTime' value='" + htmlEscape(evt.endTime) + "' required>";
+      h += "<label style='margin-top:6px;display:block;'>Volume:</label><input type='number' name='volume' min='0' max='21' value='" + String(evt.volume) + "'>";
+    } else if (evt.type == "spot") {
+      h += "<label style='margin-top:6px;display:block;'>Spot:</label><select name='target'>";
+      for (int t = 1; t <= 10; t++) h += "<option value='" + String(t) + "' " + (t == evt.target ? "selected" : "") + ">Spot " + String(t) + "</option>";
+      h += "</select><label style='margin-top:6px;display:block;'>Repeat:</label><select name='repeat'>";
+      for (int r = 1; r <= 5; r++) h += "<option value='" + String(r) + "' " + (r == evt.repeat ? "selected" : "") + ">" + String(r) + "x</option>";
+      h += "</select><label style='margin-top:6px;display:block;'>Volume:</label><input type='number' name='volume' min='0' max='21' value='" + String(evt.volume) + "'>";
+    }
+    h += "<div class='modal-btns'><button type='button' onclick=\"saveEditEvent('" + jsQuote(evt.id) + "')\" style='background:#28a745;'>SAVE</button>";
+    h += "<button type='button' onclick=\"copyEvent('" + jsQuote(evt.id) + "')\" style='background:#17a2b8;'>COPY</button>";
+    h += "<button type='button' onclick=\"deleteEvent('" + jsQuote(evt.id) + "')\" style='background:#dc3545;'>DEL</button>";
+    h += "<button type='button' onclick=\"closeModal('editModal_" + jsQuote(evt.id) + "')\" style='background:#6c757d;'>CLOSE</button></div></form></div></div>";
+  }
+
+  h += "<div id='copyModal' class='modal'><div class='modal-box'><span class='close' onclick=\"closeModal('copyModal')\">&times;</span><h2>Copy to Days</h2><div class='checkbox-list'>";
+  h += "<label><input type='checkbox' onchange='toggleAllDays(this)'> <strong>ALL</strong></label>";
+  for (int d = 0; d < 7; d++) h += "<label><input type='checkbox' class='day-cb' value='" + String(d) + "'> " + dayNames[d] + "</label>";
+  h += "</div><div class='modal-btns'><button type='button' onclick='confirmCopy()' style='background:#28a745;'>COPY</button><button type='button' onclick=\"closeModal('copyModal')\" style='background:#6c757d;'>CLOSE</button></div></div></div>";
+
+  h += "<script>";
+  h += "let copyEventId='';";
+  h += "function updateForm(){var t=document.querySelector('#createForm select[name=type]').value;var isSpot=t==='spot';document.getElementById('playlistFields').style.display=t==='playlist'?'block':'none';document.getElementById('volumeFields').style.display=t==='volume'?'block':'none';document.getElementById('spotFields').style.display=isSpot?'block':'none';document.getElementById('endTimeRow').style.display=isSpot?'none':'block';}";
+  h += "function saveNewEvent(){var f=document.getElementById('createForm');var d=new FormData(f);fetch(API_BASE + '/api/event/add',{method:'POST',body:new URLSearchParams(d)}).then(r=>{if(r.ok||r.status===303)setTimeout(()=>location.reload(),100);});}";
+  h += "function saveEditEvent(id){var f=document.getElementById('editForm_'+id);var d=new FormData(f);fetch(API_BASE + '/api/event/edit?id='+encodeURIComponent(id),{method:'POST',body:new URLSearchParams(d)}).then(r=>{if(r.ok||r.status===303)setTimeout(()=>location.reload(),100);});}";
+  h += "function deleteEvent(id){if(confirm('Delete?'))fetch(API_BASE + '/api/event/delete?id='+encodeURIComponent(id)).then(r=>{if(r.ok)setTimeout(()=>location.reload(),100);});}";
+  h += "function copyEvent(id){copyEventId=id;document.querySelectorAll('.day-cb').forEach(function(c){c.checked=false;});openModal('copyModal');}";
+  h += "function confirmCopy(){var days=[];document.querySelectorAll('.day-cb:checked').forEach(function(c){days.push(c.value);});fetch(API_BASE + '/api/event/copy?id='+encodeURIComponent(copyEventId)+'&days='+encodeURIComponent(days.join(','))).then(r=>{if(r.ok||r.status===303)setTimeout(()=>location.reload(),100);});}";
+  h += "updateForm();";
+  h += "</script>";
+
+  h += "</div></body></html>";
+  return h;
+}
+
+String getSystemUI() {
+  String h = getHeader();
+  h += "<div class='main'><h1>System</h1><div class='grid'>";
+  h += "<div class='tile'><h2>Network</h2><form action='/api/net' method='POST'><label>Mode:</label><select name='dhcp'><option value='1' " + String(cfg.dhcp ? "selected" : "") + ">DHCP</option><option value='0' " + String(!cfg.dhcp ? "selected" : "") + ">STATIC</option></select>";
+  h += "<label style='margin-top:6px;display:block;'>IP:</label><input name='ip' value='" + htmlEscape(cfg.ip) + "'><label style='margin-top:6px;display:block;'>GW:</label><input name='gw' value='" + htmlEscape(cfg.gw) + "'><label style='margin-top:6px;display:block;'>Mask:</label><input name='mask' value='" + htmlEscape(cfg.mask) + "'><label style='margin-top:6px;display:block;'>DNS:</label><input name='dns' value='" + htmlEscape(cfg.dns) + "'>";
+  h += "<button type='submit' style='width:100%;margin-top:6px;'>SAVE</button></form></div>";
+
+  h += "<div class='tile'><h2>Volume</h2><form action='/api/vol' method='POST'><label>Music:</label><select name='musicvol'>";
+  for (int i = 0; i <= 21; i++) h += "<option value='" + String(i) + "' " + (defaultMusicVolume == i ? "selected" : "") + ">" + String(i) + "</option>";
+  h += "</select><label style='margin-top:6px;display:block;'>Spot:</label><select name='spotvol'>";
+  for (int i = 0; i <= 21; i++) h += "<option value='" + String(i) + "' " + (defaultSpotVolume == i ? "selected" : "") + ">" + String(i) + "</option>";
+  h += "</select><button type='submit' style='width:100%;margin-top:6px;'>SAVE</button></form></div>";
+
+  h += "<div class='tile'><h2>Time</h2><form action='/api/time' method='POST'><label>NTP:</label><input name='ntp' value='" + htmlEscape(cfg.ntpServer) + "'><label style='margin-top:6px;display:block;'>TZ:</label><input name='tz' value='" + htmlEscape(cfg.tz) + "'><button type='submit' style='width:100%;margin-top:6px;'>SAVE</button></form></div>";
+  h += "<div class='tile'><button onclick=\"if(confirm('Restart?'))fetch('/api/restart').then(()=>setTimeout(()=>location.reload(),500));\" style='background:#d73a49;width:100%;padding:10px;'>RESTART</button></div>";
+  h += "</div></div></body></html>";
+  return h;
+}
+
+String getSetupUI() {
+  return "<h1 style='text-align:center;margin-top:50px;'>Setup Mode<br>Connect to: Jardio-SP1 / admin123</h1>";
+}
+
+// ========== REQUEST HANDLERS ==========
+void handleSavePlaylistsFor(WebServer& ws) {
+  for (int i = 1; i <= 10; i++) {
+    String filename = "/playlist/pl" + String(i) + ".csv";
+    SD.remove(filename);
+    File f = SD.open(filename, FILE_WRITE);
+    if (f) {
+      for (int j = 0; j < ws.args(); j++) {
+        if (ws.argName(j) == "pl" + String(i)) {
+          String val = urlDecode(ws.arg(j));
+          f.println(val);
+        }
+      }
+      f.close();
+    }
+  }
+  ws.sendHeader("Location", "/playlists");
+  ws.send(303);
+}
+
+void setPlaylistModeFromArgsFor(WebServer& ws) {
+  for (int i = 1; i <= 10; i++) {
+    String sh = "sh" + String(i);
+    String st = "st" + String(i);
+    playlistShuffle[i] = ws.hasArg(sh);
+    if (ws.hasArg(st)) {
+      int v = ws.arg(st).toInt();
+      if (v < 0) v = 0;
+      playlistStartIndex[i] = v;
+    }
+  }
+  saveConfig();
+}
+
+void handleAddEventFor(WebServer& ws) {
+  if (!ws.hasArg("day") || !ws.hasArg("startTime") || !ws.hasArg("type")) {
+    ws.send(400, "text/plain", "Missing required args");
+    return;
+  }
+  if (scheduleEventCount >= 100) {
+    ws.send(400, "text/plain", "Scheduler full");
+    return;
+  }
+
+  ScheduleEvent evt;
+  evt.id = generateEventId();
+  evt.day = ws.arg("day").toInt();
+  evt.startTime = ws.arg("startTime");
+  evt.endTime = "";
+  evt.type = ws.arg("type");
+  evt.target = 0;
+  evt.repeat = 1;
+  evt.volume = defaultMusicVolume;
+  resetEventRuntimeState(evt);
+
+  if (evt.type == "playlist") {
+    if (!ws.hasArg("endTime") || !ws.hasArg("playlistTarget")) {
+      ws.send(400, "text/plain", "Playlist requires endTime and playlistTarget");
+      return;
+    }
+    evt.endTime = ws.arg("endTime");
+    evt.target = ws.arg("playlistTarget").toInt();
+  } else if (evt.type == "volume") {
+    if (!ws.hasArg("endTime") || !ws.hasArg("volumeValue")) {
+      ws.send(400, "text/plain", "Volume requires endTime and volumeValue");
+      return;
+    }
+    evt.endTime = ws.arg("endTime");
+    evt.volume = ws.arg("volumeValue").toInt();
+  } else if (evt.type == "spot") {
+    if (!ws.hasArg("spotTarget")) {
+      ws.send(400, "text/plain", "Spot requires spotTarget");
+      return;
+    }
+    evt.target = ws.arg("spotTarget").toInt();
+    evt.repeat = ws.hasArg("repeat") ? ws.arg("repeat").toInt() : 1;
+    evt.volume = ws.hasArg("spotVolume") ? ws.arg("spotVolume").toInt() : defaultSpotVolume;
+  } else {
+    ws.send(400, "text/plain", "Invalid event type");
+    return;
+  }
+
+  evt.repeat = constrain(evt.repeat, 1, 5);
+  evt.volume = constrain(evt.volume, 0, 21);
+  if (evt.type == "playlist" || evt.type == "spot") evt.target = constrain(evt.target, 1, 10);
+  if (evt.day < 0 || evt.day > 6 || !isValidTimeRangeForEvent(evt)) {
+    ws.send(400, "text/plain", "Invalid event data");
+    return;
+  }
+
+  scheduleEvents[scheduleEventCount++] = evt;
+  saveScheduleEvents();
+  ws.sendHeader("Location", "/scheduler");
+  ws.send(303);
+}
+
+void handleEditEventFor(WebServer& ws) {
+  if (!ws.hasArg("id")) {
+    ws.send(404);
+    return;
+  }
+  String eventId = ws.arg("id");
+
+  for (int i = 0; i < scheduleEventCount; i++) {
+    if (scheduleEvents[i].id == eventId) {
+      ScheduleEvent updated = scheduleEvents[i];
+      if (ws.hasArg("day")) updated.day = ws.arg("day").toInt();
+      if (ws.hasArg("startTime")) updated.startTime = ws.arg("startTime");
+      if (updated.type == "playlist" || updated.type == "volume") {
+        if (ws.hasArg("endTime")) updated.endTime = ws.arg("endTime");
+      } else updated.endTime = "";
+      if (ws.hasArg("target")) updated.target = ws.arg("target").toInt();
+      if (ws.hasArg("repeat")) updated.repeat = constrain(ws.arg("repeat").toInt(), 1, 5);
+      if (ws.hasArg("volume")) updated.volume = constrain(ws.arg("volume").toInt(), 0, 21);
+      if (updated.type == "playlist" || updated.type == "spot") updated.target = constrain(updated.target, 1, 10);
+
+      if (updated.day < 0 || updated.day > 6 || !isValidTimeRangeForEvent(updated)) {
+        ws.send(400, "text/plain", "Invalid event data");
+        return;
+      }
+
+      resetEventRuntimeState(updated);
+      scheduleEvents[i] = updated;
+      saveScheduleEvents();
+      ws.sendHeader("Location", "/scheduler");
+      ws.send(303);
+      return;
+    }
+  }
+  ws.send(404);
+}
+
+void handleDeleteEventFor(WebServer& ws) {
+  if (!ws.hasArg("id")) {
+    ws.send(404);
+    return;
+  }
+  String eventId = ws.arg("id");
+
+  for (int i = 0; i < scheduleEventCount; i++) {
+    if (scheduleEvents[i].id == eventId) {
+      for (int j = i; j < scheduleEventCount - 1; j++) scheduleEvents[j] = scheduleEvents[j + 1];
+      scheduleEventCount--;
+      saveScheduleEvents();
+      ws.send(200);
+      return;
+    }
+  }
+  ws.send(404);
+}
+
+void handleCopyEventFor(WebServer& ws) {
+  if (!(ws.hasArg("id") && ws.hasArg("days"))) {
+    ws.send(400);
+    return;
+  }
+
+  String eventId = ws.arg("id");
+  String daysStr = ws.arg("days");
+  int srcIdx = -1;
+  for (int i = 0; i < scheduleEventCount; i++) {
+    if (scheduleEvents[i].id == eventId) {
+      srcIdx = i;
+      break;
+    }
+  }
+  if (srcIdx < 0) {
+    ws.send(404);
+    return;
+  }
+
+  int days[7], dayCount = 0;
+  String currentNum = "";
+  for (int i = 0; i <= daysStr.length(); i++) {
+    char c = (i < daysStr.length()) ? daysStr[i] : ',';
+    if (c == ',') {
+      if (currentNum.length() > 0 && dayCount < 7) {
+        days[dayCount++] = currentNum.toInt();
+        currentNum = "";
+      }
+    } else currentNum += c;
+  }
+
+  bool selectedDays[7] = { false, false, false, false, false, false, false };
+  for (int d = 0; d < dayCount; d++)
+    if (days[d] >= 0 && days[d] < 7) selectedDays[days[d]] = true;
+
+  ScheduleEvent src = scheduleEvents[srcIdx];
+  for (int day = 0; day < 7; day++) {
+    if (!selectedDays[day]) continue;
+    if (day == src.day) continue;
+
+    bool duplicate = false;
+    for (int i = 0; i < scheduleEventCount; i++) {
+      if (eventsEquivalentForDay(src, scheduleEvents[i], day)) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (duplicate) continue;
+    if (scheduleEventCount >= 100) break;
+
+    ScheduleEvent& newEvt = scheduleEvents[scheduleEventCount];
+    newEvt = src;
+    newEvt.id = generateEventId();
+    newEvt.day = day;
+    resetEventRuntimeState(newEvt);
+    scheduleEventCount++;
+  }
+
+  saveScheduleEvents();
+  ws.sendHeader("Location", "/scheduler");
+  ws.send(303);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.printf("\n\n[BOOT] Jardio OS %s starting...\n", FIRMWARE_VERSION);
+
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, sdSPI, 20000000)) {
+    Serial.println("[ERROR] SD card init FAILED!");
+    while (1) delay(1000);
+  }
+  Serial.println("[OK] SD card initialized");
+
+  initPlaylists();
+  initScheduler();
+
+  const char* dirs[] = { "/config", "/music", "/playlist", "/scheduler", "/spot" };
+  for (const char* d : dirs)
+    if (!SD.exists(d)) SD.mkdir(d);
+
+  indexTracks();
+  loadConfig();
+  loadScheduleEvents();
+
+  Serial.printf("[CONFIG] Loaded - Music Vol: %d, Spot Vol: %d\n", defaultMusicVolume, defaultSpotVolume);
+
+  if (cfg.ssid.length() > 0) {
+    WiFi.mode(WIFI_STA);
+    if (!cfg.dhcp) {
+      IPAddress ip, gw, nm, d1;
+      ip.fromString(cfg.ip);
+      gw.fromString(cfg.gw);
+      nm.fromString(cfg.mask);
+      d1.fromString(cfg.dns);
+      WiFi.config(ip, gw, nm, d1);
+    }
+    WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
+    unsigned long st = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - st < 8000) delay(500);
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    apMode = true;
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("Jardio-SP1", "admin123");
+    Serial.println("[WIFI] AP Mode: Jardio-SP1 / admin123");
+  } else {
+    Serial.printf("[WIFI] Connected: %s - IP: %s\n", cfg.ssid.c_str(), WiFi.localIP().toString().c_str());
+    MDNS.begin(cfg.mdns.c_str());
+    configTime(0, 0, cfg.ntpServer.c_str());
+    setenv("TZ", cfg.tz.c_str(), 1);
+    tzset();
+  }
+
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  audio.setVolume(currentMusicVolume);
+  Serial.println("[AUDIO] I2S configured");
+
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 20000, NULL, 6, NULL, 1);
+  xTaskCreatePinnedToCore(schedulerTask, "SchedulerTask", 5000, NULL, 4, &schedulerTaskHandle, 0);
+  Serial.println("[TASKS] Created");
+
+  // ===== UI ROUTES (PORT 80) =====
+  server.on("/", []() {
+    server.send(200, "text/html", apMode ? getSetupUI() : getDashboard());
+  });
+  server.on("/media", []() {
+    server.send(200, "text/html", getMediaUI());
+  });
+  server.on("/playlists", []() {
+    server.send(200, "text/html", getPlaylistUI());
+  });
+  server.on("/scheduler", []() {
+    server.send(200, "text/html", getSchedulerUI());
+  });
+  server.on("/system", []() {
+    server.send(200, "text/html", getSystemUI());
+  });
+
+  // ===== API ROUTES (PORT 11000) =====
+  apiServer.on("/api/saveplaylists", HTTP_POST, []() {
+    handleSavePlaylistsFor(apiServer);
+  });
+
+  apiServer.on("/api/playlistmode", HTTP_POST, []() {
+    setPlaylistModeFromArgsFor(apiServer);
+    apiServer.sendHeader("Location", "/playlists");
+    apiServer.send(303);
+  });
+
+  apiServer.on("/api/event/add", HTTP_POST, []() {
+    handleAddEventFor(apiServer);
+  });
+  apiServer.on("/api/event/edit", HTTP_POST, []() {
+    handleEditEventFor(apiServer);
+  });
+  apiServer.on("/api/event/delete", []() {
+    handleDeleteEventFor(apiServer);
+  });
+  apiServer.on("/api/event/copy", []() {
+    handleCopyEventFor(apiServer);
+  });
+
+  apiServer.on("/api/play", []() {
+    if (apiServer.hasArg("f")) {
+      String fName = urlDecode(apiServer.arg("f"));
+      userStopped = false;
+      pausedByUserWithTrack = false;
+      pausedTrackFile = "";
+      pausedPlaylistNum = 0;
+      pausedPlaylistIndex = -1;
+      playTrackByName(fName);
+    }
+    apiServer.send(200);
+  });
+
+  apiServer.on("/api/play-spot", []() {
+    if (!apiServer.hasArg("f")) {
+      apiServer.send(400, "text/plain", "Missing arg f");
+      return;
+    }
+
+    String raw = urlDecode(apiServer.arg("f"));
+    raw.trim();
+
+    int vol = apiServer.hasArg("vol") ? apiServer.arg("vol").toInt() : defaultSpotVolume;
+    vol = constrain(vol, 0, 21);
+
+    String fName = "";
+    bool numeric = raw.length() > 0;
+    for (unsigned int i = 0; i < raw.length(); i++) {
+      if (!isDigit(raw.charAt(i))) {
+        numeric = false;
+        break;
+      }
+    }
+
+    if (numeric) {
+      int spotNum = raw.toInt();
+      if (spotNum >= 1 && spotNum <= 10) fName = findSpotFile(spotNum);
+    }
+
+    if (fName.length() == 0) {
+      apiServer.send(404, "text/plain", "Spot file not found");
+      return;
+    }
+
+    nowPlayingTrack = fName;
+    playSpot(fName, vol, true);
+    apiServer.send(200, "text/plain", "OK");
+  });
+
+  apiServer.on("/api/pause", []() {
+    if (!userPaused && audio.isRunning()) {
+      transportTransition = true;
+
+      pausedTrackFile = lastPlayedFile;
+      pausedPlaylistNum = currentPlaylistNum;
+      pausedPlaylistIndex = currentPlaylistTrackIndex;
+      pausedByUserWithTrack = (pausedTrackFile.length() > 0);
+
+      audio.stopSong();
+      userPaused = true;
+      userStopped = false;
+      isMusicPlaying = false;
+
+      transportTransition = false;
+      Serial.println("[API] PAUSE");
+    }
+    apiServer.send(200);
+  });
+
+  apiServer.on("/api/resume", []() {
+    if (userPaused) {
+      transportTransition = true;
+      userPaused = false;
+      userStopped = false;
+
+      if (pausedByUserWithTrack && pausedTrackFile.length() > 0) {
+        audio.setVolume(currentMusicVolume);
+        audio.connecttoFS(SD, pausedTrackFile.c_str());
+
+        isMusicPlaying = true;
+        manualDirectPlayback = (pausedPlaylistNum == 0);
+        currentPlaylistNum = pausedPlaylistNum;
+        currentPlaylistTrackIndex = pausedPlaylistIndex;
+
+        int slash = pausedTrackFile.lastIndexOf('/');
+        nowPlayingTrack = (slash >= 0) ? pausedTrackFile.substring(slash + 1) : pausedTrackFile;
+
+        pausedByUserWithTrack = false;
+        pausedTrackFile = "";
+        pausedPlaylistNum = 0;
+        pausedPlaylistIndex = -1;
+
+        Serial.println("[API] RESUME (same track)");
+      } else {
+        tryResumeScheduledOrSilence();
+        Serial.println("[API] RESUME (scheduler)");
+      }
+
+      transportTransition = false;
+    } else if (userStopped) {
+      transportTransition = true;
+      userStopped = false;
+      userPaused = false;
+      tryResumeScheduledOrSilence();
+      transportTransition = false;
+      Serial.println("[API] RESUME (after STOP)");
+    } else if (!audio.isRunning()) {
+      transportTransition = true;
+      tryResumeScheduledOrSilence();
+      transportTransition = false;
+      Serial.println("[API] RESUME (scheduler)");
+    }
+    apiServer.send(200);
+  });
+
+  apiServer.on("/api/stop", []() {
+    audio.stopSong();
+    userPaused = false;
+    userStopped = true;
+    isSpotPlaying = false;
+    manualSpotInProgress = false;
+    waitingSpotReplay = false;
+    isMusicPlaying = false;
+    manualDirectPlayback = false;
+    currentPlaylistNum = 0;
+    currentPlaylistTrackIndex = -1;
+    nowPlayingTrack = "";
+    currentPlaylistName = "";
+
+    pausedByUserWithTrack = false;
+    pausedTrackFile = "";
+    pausedPlaylistNum = 0;
+    pausedPlaylistIndex = -1;
+    transportTransition = false;
+
+    Serial.println("[API] STOP");
+    apiServer.send(200);
+  });
+
+  apiServer.on("/api/vol", HTTP_POST, []() {
+    if (apiServer.hasArg("musicvol")) {
+      defaultMusicVolume = constrain(apiServer.arg("musicvol").toInt(), 0, 21);
+      currentMusicVolume = defaultMusicVolume;
+      cfg.musicVol = defaultMusicVolume;
+    }
+    if (apiServer.hasArg("spotvol")) {
+      defaultSpotVolume = constrain(apiServer.arg("spotvol").toInt(), 0, 21);
+      currentSpotVolume = defaultSpotVolume;
+      cfg.spotVol = defaultSpotVolume;
+    }
+    saveConfig();
+    apiServer.sendHeader("Location", "/system");
+    apiServer.send(303);
+  });
+
+  apiServer.on("/api/time", HTTP_POST, []() {
+    if (apiServer.hasArg("ntp")) cfg.ntpServer = apiServer.arg("ntp");
+    if (apiServer.hasArg("tz")) cfg.tz = apiServer.arg("tz");
+    saveConfig();
+    configTime(0, 0, cfg.ntpServer.c_str());
+    setenv("TZ", cfg.tz.c_str(), 1);
+    tzset();
+    apiServer.sendHeader("Location", "/system");
+    apiServer.send(303);
+  });
+
+  apiServer.on("/api/net", HTTP_POST, []() {
+    cfg.dhcp = (apiServer.arg("dhcp") == "1");
+    cfg.ip = apiServer.arg("ip");
+    cfg.gw = apiServer.arg("gw");
+    cfg.mask = apiServer.arg("mask");
+    cfg.dns = apiServer.arg("dns");
+    saveConfig();
+    apiServer.sendHeader("Location", "/system");
+    apiServer.send(303);
+  });
+
+  apiServer.on("/api/restart", []() {
+    apiServer.send(200);
+    delay(500);
+    ESP.restart();
+  });
+
+  // NOTE: upload handlers still use global server.upload() in your current code.
+  // Keep only if you rewrite handleFileUpload for apiServer.
+  // apiServer.on("/api/upload/music", HTTP_POST, []() {
+  //   indexTracks();
+  //   apiServer.sendHeader("Location", "/media");
+  //   apiServer.send(303);
+  // }, handleFileUpload);
+  //
+  // apiServer.on("/api/upload/spot", HTTP_POST, []() {
+  //   indexTracks();
+  //   apiServer.sendHeader("Location", "/media");
+  //   apiServer.send(303);
+  // }, handleFileUpload);
+
+  apiServer.on("/api/delete", []() {
+    if (apiServer.hasArg("p")) {
+      SD.remove(urlDecode(apiServer.arg("p")));
+      indexTracks();
+    }
+    apiServer.send(200);
+  });
+
+  server.begin();
+  apiServer.begin();
+  Serial.println("[OK] Web server started on :80");
+  Serial.println("[OK] API server started on :11000");
+  Serial.printf("[BOOT] Jardio OS %s READY!\n", FIRMWARE_VERSION);
+}
+
+void loop() {
+  server.handleClient();     // UI
+  apiServer.handleClient();  // API
+  delay(1);
+}
